@@ -1,32 +1,6 @@
-# tasklet
-[![CircleCI](https://circleci.com/gh/unix121/tasklet.svg?style=shield)](https://circleci.com/gh/unix121/tasklet)
-![Crates.io](https://img.shields.io/crates/d/tasklet)
-![Crates.io](https://img.shields.io/crates/v/tasklet)
-![GitHub last commit](https://img.shields.io/github/last-commit/unix121/tasklet)
-
-⏱️ A task scheduling library written in Rust
-
-## Dependencies
-
-* cron (0.7.0)
-* chrono (0.4.19)
-* time (0.2.23)
-* log (0.4)
-
-## Use this library
-
-In your `Cargo.toml` add:
-```
-[dependencies]
-tasklet = "0.1.0"
-```
-
-## Example
-Find more examples in the [examples](/examples) folder.
-```rust
-use tasklet::{TaskScheduler, Task};
+use log::{error, info};
 use simple_logger::SimpleLogger;
-use log::{info, error};
+use tasklet::{Task, TaskScheduler};
 
 /// A simple example of a task with two step,
 /// that might work or fail some times.
@@ -41,10 +15,7 @@ fn main() {
     let mut scheduler = TaskScheduler::new(2000, chrono::Local);
 
     // Create a task with 2 steps and add it to the scheduler.
-    let mut task = Task::new("1 * * * * * *",
-                             Some("A simple task"),
-                             None,
-                             chrono::Local);
+    let mut task = Task::new("1 * * * * * *", Some("A simple task"), None, chrono::Local);
     // A normal step 1.
     task.add_step(Some("Step 1"), || {
         info!("Hello from step 1");
@@ -69,8 +40,3 @@ fn main() {
     // Execute the scheduler.
     scheduler.run();
 }
-```
-
-## Author
-
-Stavros Grigoriou ([unix121](github.com/unix121))

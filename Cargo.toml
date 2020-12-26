@@ -1,0 +1,18 @@
+[package]
+name = "tasklet"
+version = "0.1.0"
+authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
+edition = "2018"
+license = "MIT"
+repositoy = "https://github.com/unix121/tasklet"
+readme = "README.md"
+description = "A task scheduling library."
+
+[dependencies]
+cron = "0.7.0"
+chrono = "0.4.19"
+time = "0.2.23"
+log = "0.4"
+
+[dev-dependencies]
+simple_logger = "1.11.0"
