@@ -6,7 +6,7 @@ use log::{debug, error, info, warn};
 use std::thread;
 use std::time::Duration;
 
-/// Task execution posible statuses.
+/// Task execution possible statuses.
 pub(crate) enum ExecutionStatus {
     Success,
     HadError(usize),
@@ -52,8 +52,8 @@ where
         TaskScheduler {
             tasks: Vec::new(),
             task_gen: None,
-            sleep: sleep,
-            timezone: timezone,
+            sleep,
+            timezone,
             next_id: 0,
         }
     }
@@ -192,6 +192,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::TaskBuilder;
     use chrono::Local;
     use std::thread;
     use std::time::Duration;
@@ -220,7 +221,7 @@ mod test {
     /// in the case of task returning error status.
     #[test]
     fn test_scheduler_normal_flow_error_case() {
-        // Create a new scheduler isntance.
+        // Create a new scheduler instance.
         let mut scheduler = TaskScheduler::new(500, Local);
 
         // Create a task.
@@ -236,7 +237,48 @@ mod test {
         scheduler.init();
         thread::sleep(Duration::from_millis(1000));
         scheduler.execute_tasks();
-        // The task should be removed after it's execution cyrcle.
+        // The task should be removed after it's execution circle.
         assert_eq!(scheduler.tasks.len(), 0);
+    }
+
+    /// Test the normal functionality of a task generation function inside
+    /// a task scheduler.
+    #[test]
+    fn test_scheduler_with_generator() {
+        // Create a new scheduler instance.
+        let mut scheduler = TaskScheduler::new(500, Local);
+
+        // Add a task generator function that does now.
+        scheduler.set_task_gen(TaskGenerator::new("* * * * * * *", Local, || None));
+
+        // Should start with zero tasks.
+        assert_eq!(scheduler.tasks.len(), 0);
+
+        // Execute the task generator.
+        thread::sleep(Duration::from_millis(1000));
+        scheduler.run_task_gen();
+
+        // The number of tasks should be zero again.
+        assert_eq!(scheduler.tasks.len(), 0);
+
+        // Update the generator to actually create a new task.
+        scheduler.set_task_gen(TaskGenerator::new("* * * * * * *", Local, || {
+            // Run at second "1" of every minute.
+
+            // Create the task that will execute 2 total times.
+            // Return the task for the execution queue.
+            Some(
+                TaskBuilder::new(chrono::Local)
+                    .every("* * * * * * *")
+                    .build(),
+            )
+        }));
+
+        // Execute the task generator.
+        thread::sleep(Duration::from_millis(1000));
+        scheduler.run_task_gen();
+
+        // The number of tasks should be zero again.
+        assert_eq!(scheduler.tasks.len(), 1);
     }
 }

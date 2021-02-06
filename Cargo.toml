@@ -1,6 +1,6 @@
 [package]
 name = "tasklet"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -9,10 +9,10 @@ readme = "README.md"
 description = "A task scheduling library."
 
 [dependencies]
-cron = "0.7.0"
+cron = "0.8.0"
 chrono = "0.4.19"
-time = "0.2.23"
-log = "0.4"
+time = "0.2.25"
+log = "0.4.14"
 
 [dev-dependencies]
 simple_logger = "1.11.0"

@@ -11,9 +11,9 @@ use log::{debug, error, warn};
 /// Contains the executable body and an optional short description.
 pub struct TaskStep<'a> {
     /// The function's body.
-    function: Box<dyn (FnMut() -> Result<(), ()>) + 'a>,
+    pub(crate) function: Box<dyn (FnMut() -> Result<(), ()>) + 'a>,
     /// An (optional) short description.
-    description: String,
+    pub(crate) description: String,
 }
 
 /// Available task statuses.
@@ -38,15 +38,15 @@ where
     T: TimeZone,
 {
     /// Task's executable tasks.
-    steps: Vec<TaskStep<'a>>,
+    pub(crate) steps: Vec<TaskStep<'a>>,
     /// The execution schedule.
-    schedule: Schedule,
+    pub(crate) schedule: Schedule,
     /// Total number of executions, if `None` then it will run forever.
-    repeats: Option<usize>,
+    pub(crate) repeats: Option<usize>,
     /// (Optional) Task's description.
-    description: String,
+    pub(crate) description: String,
     /// The timezone of the task.
-    timezone: T,
+    pub(crate) timezone: T,
     /// (Internal) task id.
     pub(crate) task_id: usize,
     /// (Internal) next execution time.
@@ -108,26 +108,7 @@ where
     ///
     /// * description   - A short task step description (Optional).
     /// * function      - The executable function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use tasklet::Task;
-    /// // Create a task that will run every second for 2 max repeats.
-    /// let mut task = Task::new("* * * * * * *", None, Some(2), chrono::Local);
-    /// // Add 2 steps in the task.
-    /// task.add_step(Some("Step number 1"), || Ok(()))
-    ///     .add_step(Some("Step number 2"), || Ok(()));
-    /// ```
-    ///
-    /// ```
-    /// # use tasklet::Task;
-    /// // Create a task that will run every second forever.
-    /// let mut task = Task::new("* * * * * * *", None, None, chrono::Local);
-    /// // Add one step to the task.
-    /// task.add_step(Some("I will say hello evrey second"), || { println!("Hello!"); Ok(())});
-    /// ```
-    pub fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<'a, T>
+    pub(crate) fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<'a, T>
     where
         F: (FnMut() -> Result<(), ()>) + 'a,
     {
@@ -138,6 +119,26 @@ where
                 None => "-".to_string(),
             },
         });
+        self
+    }
+
+    /// Set the value of the steps vector.
+    ///
+    /// # Arguments
+    ///
+    /// * steps   - A vector that contains the executable steps.
+    pub(crate) fn set_steps(&mut self, steps: Vec<TaskStep<'a>>) -> &mut Task<'a, T> {
+        self.steps = steps;
+        self
+    }
+
+    /// Set the value of `schedule` property.
+    ///
+    /// # Arguments
+    ///
+    /// * schedule  - The schedule.
+    pub(crate) fn set_schedule(&mut self, schedule: Schedule) -> &mut Task<'a, T> {
+        self.schedule = schedule;
         self
     }
 
@@ -262,6 +263,18 @@ mod test {
         assert_eq!(task.status, Status::Executed);
         task.reschedule();
         assert_eq!(task.status, Status::Finished);
+    }
+
+    /// Test the normal execution of the `set_schedule` function.
+    #[test]
+    fn test_task_set_schedule() {
+        let schedule: Schedule = "* * * * * * *".parse().unwrap();
+        let mut task = Task::new("* * * * * * *", None, None, Local);
+        task.set_schedule(schedule);
+        task.add_step(None, || Ok(()));
+        assert_eq!(task.status, Status::Init);
+        task.init(0);
+        assert_eq!(task.status, Status::Scheduled);
     }
 
     /// Test the normal execution of a simple task.

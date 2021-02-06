@@ -2,3 +2,4 @@
 Cargo.lock
 /tests
 .idea/
+cobertura.xml

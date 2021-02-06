@@ -1,32 +1,36 @@
-# tasklet
+![](tasklet-logo.png)
+
 [![CircleCI](https://circleci.com/gh/unix121/tasklet.svg?style=shield)](https://circleci.com/gh/unix121/tasklet)
 ![Crates.io](https://img.shields.io/crates/d/tasklet)
 ![Crates.io](https://img.shields.io/crates/v/tasklet)
 ![GitHub last commit](https://img.shields.io/github/last-commit/unix121/tasklet)
+[![codecov](https://codecov.io/gh/unix121/tasklet/branch/main/graph/badge.svg?token=HBIQJYK1EU)](https://codecov.io/gh/unix121/tasklet)
+![License](https://img.shields.io/github/license/unix121/tasklet)
+[![GitHub issues](https://img.shields.io/github/issues/unix121/tasklet)](https://github.com/unix121/tasklet/issues)
 
 ⏱️ A task scheduling library written in Rust
 
 ## Dependencies
 
-* cron (0.7.0)
+* cron (0.8.0)
 * chrono (0.4.19)
-* time (0.2.23)
-* log (0.4)
+* time (0.2.25)
+* log (0.4.14)
 
 ## Use this library
 
 In your `Cargo.toml` add:
 ```
 [dependencies]
-tasklet = "0.1.0"
+tasklet = "0.1.1"
 ```
 
 ## Example
 Find more examples in the [examples](/examples) folder.
 ```rust
-use tasklet::{TaskScheduler, Task};
+use log::{error, info};
 use simple_logger::SimpleLogger;
-use log::{info, error};
+use tasklet::{TaskBuilder, TaskScheduler};
 
 /// A simple example of a task with two step,
 /// that might work or fail some times.
@@ -41,30 +45,29 @@ fn main() {
     let mut scheduler = TaskScheduler::new(2000, chrono::Local);
 
     // Create a task with 2 steps and add it to the scheduler.
-    let mut task = Task::new("1 * * * * * *",
-                             Some("A simple task"),
-                             None,
-                             chrono::Local);
-    // A normal step 1.
-    task.add_step(Some("Step 1"), || {
-        info!("Hello from step 1");
-        Ok(()) // Let the scheduler know this step was a success.
-    });
-    // A step 2 that can fail some times.
-    task.add_step(Some("Step 2"), move || {
-        if exec_count % 2 == 0 {
-            error!("Oh no this step failed!");
-            exec_count += 1;
-            Err(()) // Indicate that this step was a fail.
-        } else {
-            info!("Hello from step 2");
-            exec_count += 1;
-            Ok(()) // Indicate that this step was a success.
-        }
-    });
-
+    // The second step fails every second execution.
     // Append the task to the scheduler.
-    scheduler.add_task(task);
+    scheduler.add_task(
+        TaskBuilder::new(chrono::Local)
+            .every("1 * * * * * *")
+            .description("A simple task")
+            .add_step(None, || {
+                info!("Hello from step 1");
+                Ok(()) // Let the scheduler know this step was a success.
+            })
+            .add_step(None, move || {
+                if exec_count % 2 == 0 {
+                    error!("Oh no this step failed!");
+                    exec_count += 1;
+                    Err(()) // Indicate that this step was a fail.
+                } else {
+                    info!("Hello from step 2");
+                    exec_count += 1;
+                    Ok(()) // Indicate that this step was a success.
+                }
+            })
+            .build(),
+    );
 
     // Execute the scheduler.
     scheduler.run();

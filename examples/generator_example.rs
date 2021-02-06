@@ -1,6 +1,7 @@
 use chrono::Utc;
+use log::info;
 use simple_logger::SimpleLogger;
-use tasklet::{Task, TaskGenerator, TaskScheduler};
+use tasklet::{TaskBuilder, TaskGenerator, TaskScheduler};
 
 /// This examples shows how to use a (not so usefull) `TaskGenerator`
 /// to generate new tasks for the a `TaskScheduler`.
@@ -16,18 +17,22 @@ fn main() {
         // Run at second "1" of every minute.
 
         // Create the task that will execute 2 total times.
-        let mut task = Task::new("* * * * * * *", Some("Generated task"), Some(2), Utc);
-        task.add_step(None, || {
-            println!("[Step 1] This is a generated task!");
-            Ok(())
-        })
-        .add_step(None, || {
-            println!("[Step 2] This is a generate task!");
-            Ok(())
-        });
-
         // Return the task for the execution queue.
-        Some(task)
+        Some(
+            TaskBuilder::new(chrono::Utc)
+                .every("0,10,20,30,40,50 * * * * * *")
+                .description("Generated task")
+                .repeat(2)
+                .add_step(None, || {
+                    info!("[Step 1] This is a generated task!");
+                    Ok(())
+                })
+                .add_step(None, || {
+                    info!("[Step 2] This is generated task!");
+                    Ok(())
+                })
+                .build(),
+        )
     }));
 
     // Execute the scheduler.
