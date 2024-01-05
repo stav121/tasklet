@@ -1,12 +1,12 @@
 ![](tasklet-logo.png)
 
-[![CircleCI](https://circleci.com/gh/unix121/tasklet.svg?style=shield)](https://circleci.com/gh/unix121/tasklet)
+[![CircleCI](https://circleci.com/gh/stav121/tasklet.svg?style=shield)](https://circleci.com/gh/stav121/tasklet)
 ![Crates.io](https://img.shields.io/crates/d/tasklet)
 ![Crates.io](https://img.shields.io/crates/v/tasklet)
-![GitHub last commit](https://img.shields.io/github/last-commit/unix121/tasklet)
-[![codecov](https://codecov.io/gh/unix121/tasklet/branch/main/graph/badge.svg?token=HBIQJYK1EU)](https://codecov.io/gh/unix121/tasklet)
-![License](https://img.shields.io/github/license/unix121/tasklet)
-[![GitHub issues](https://img.shields.io/github/issues/unix121/tasklet)](https://github.com/unix121/tasklet/issues)
+![GitHub last commit](https://img.shields.io/github/last-commit/stav121/tasklet)
+[![codecov](https://codecov.io/gh/stav121/tasklet/branch/main/graph/badge.svg?token=HBIQJYK1EU)](https://codecov.io/gh/stav121/tasklet)
+![License](https://img.shields.io/github/license/stav121/tasklet)
+[![GitHub issues](https://img.shields.io/github/issues/stav121/tasklet)](https://github.com/stav121/tasklet/issues)
 
 ⏱️ A task scheduling library written in Rust
 
@@ -76,4 +76,4 @@ fn main() {
 
 ## Author
 
-Stavros Grigoriou ([unix121](github.com/unix121))
+Stavros Grigoriou ([stav121](github.com/stav121))

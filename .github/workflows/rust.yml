@@ -44,7 +44,7 @@ jobs:
 
       - name: Generate code coverage
         run: |
-          cargo tarpaulin --verbose --all-features --workspace --timeout 120 --run-types Tests Doctests --out Xml
+          cargo tarpaulin --verbose --all-features --workspace --timeout 120 --run-types Tests --run-types Doctests --out Xml
 
       - name: Coverage upload
         uses: codecov/codecov-action@v1
