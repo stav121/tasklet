@@ -3,7 +3,7 @@ use log::info;
 use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskGenerator, TaskScheduler};
 
-/// This examples shows how to use a (not so usefull) `TaskGenerator`
+/// This examples shows how to use a (not so usefully) `TaskGenerator`
 /// to generate new tasks for the a `TaskScheduler`.
 fn main() {
     // Initialize the logger.
@@ -19,7 +19,7 @@ fn main() {
         // Create the task that will execute 2 total times.
         // Return the task for the execution queue.
         Some(
-            TaskBuilder::new(chrono::Utc)
+            TaskBuilder::new(Utc)
                 .every("0,10,20,30,40,50 * * * * * *")
                 .description("Generated task")
                 .repeat(2)

@@ -23,7 +23,7 @@ where
     task_gen: Option<TaskGenerator<'a, T>>,
     /// The sleep time in ms.
     sleep: usize,
-    /// The id that shoould be assigned to the next appended task.
+    /// The id that should be assigned to the next appended task.
     next_id: usize,
     /// The main timezone used for the scheduler.
     timezone: T,
@@ -58,7 +58,7 @@ where
         }
     }
 
-    /// Set a `TaskGenerator` inistance for the TaskScheduler.
+    /// Set a `TaskGenerator` instance for the TaskScheduler.
     ///
     /// # Arguments
     ///
@@ -68,7 +68,7 @@ where
     ///
     /// ```
     /// # use tasklet::{TaskScheduler, TaskGenerator};
-    /// // Create a new `TashSceduler` instance and attach an `TaskGenerator` to it.
+    /// // Create a new `TaskScheduler` instance and attach an `TaskGenerator` to it.
     /// let mut scheduler = TaskScheduler::new(1000, chrono::Local);
     /// let mut generator = TaskGenerator::new("1 * * * * * *", chrono::Local, || None);
     /// scheduler.set_task_gen(generator);
@@ -267,11 +267,7 @@ mod test {
 
             // Create the task that will execute 2 total times.
             // Return the task for the execution queue.
-            Some(
-                TaskBuilder::new(chrono::Local)
-                    .every("* * * * * * *")
-                    .build(),
-            )
+            Some(TaskBuilder::new(Local).every("* * * * * * *").build())
         }));
 
         // Execute the task generator.
