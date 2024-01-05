@@ -12,17 +12,17 @@
 
 ## Dependencies
 
-* cron (0.8.0)
-* chrono (0.4.19)
-* time (0.2.25)
-* log (0.4.14)
+* cron (0.12.0)
+* chrono (0.4.31)
+* time (0.3.31)
+* log (0.4.20)
 
 ## Use this library
 
 In your `Cargo.toml` add:
 ```
 [dependencies]
-tasklet = "0.1.1"
+tasklet = "0.1.3"
 ```
 
 ## Example

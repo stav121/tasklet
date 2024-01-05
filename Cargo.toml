@@ -1,6 +1,6 @@
 [package]
 name = "tasklet"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 license = "MIT"
