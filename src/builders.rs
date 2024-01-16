@@ -52,7 +52,7 @@ where
     ///
     /// # Arguments
     ///
-    /// - description   - A descripotion for the task.
+    /// - description   - A description for the task.
     ///
     /// ```rust
     /// # use tasklet::TaskBuilder;
@@ -143,10 +143,10 @@ where
             self.repeats,
             self.timezone,
         );
-        task.set_schedule(match self.schedule {
-            Some(s) => s,
-            None => "* * * * * * *".parse().unwrap(),
-        });
+        task.set_schedule(
+            self.schedule
+                .unwrap_or_else(|| "* * * * * * *".parse().unwrap()),
+        );
         task.set_steps(self.steps);
         task
     }
@@ -188,7 +188,7 @@ mod test {
         assert_eq!(builder.timezone, chrono::Utc);
     }
 
-    /// Test the normal functionality of the descrption() function of `TaskBuilder`.
+    /// Test the normal functionality of the description() function of `TaskBuilder`.
     #[test]
     pub fn test_task_builder_with_description() {
         let builder = TaskBuilder::new(chrono::Utc).description("Some description");
@@ -208,7 +208,7 @@ mod test {
         assert_some!(builder.schedule);
     }
 
-    /// Test the normal functionality of the repeat() functiono of the `TaskBuilder`.
+    /// Test the normal functionality of the repeat() function of the `TaskBuilder`.
     #[test]
     pub fn test_task_builder_repeat() {
         let builder = TaskBuilder::new(chrono::Utc).repeat(5);

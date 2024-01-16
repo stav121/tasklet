@@ -1,5 +1,4 @@
 use chrono::Utc;
-use log::info;
 use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskScheduler};
 
@@ -13,7 +12,7 @@ fn main() {
 
     // Append a new task with two steps.
     scheduler.add_task(
-        TaskBuilder::new(chrono::Utc)
+        TaskBuilder::new(Utc)
             .every("* * * * * *")
             .description("Some description")
             .repeat(5)

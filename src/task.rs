@@ -108,6 +108,7 @@ where
     ///
     /// * description   - A short task step description (Optional).
     /// * function      - The executable function.
+    #[cfg(test)]
     pub(crate) fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<'a, T>
     where
         F: (FnMut() -> Result<(), ()>) + 'a,
@@ -313,7 +314,7 @@ mod test {
         }
     }
 
-    /// Test the rescheduling of an unintialized task.
+    /// Test the rescheduling of an uninitialized task.
     #[test]
     #[should_panic(expected = "Task not initialized yet!")]
     fn test_reschedule_init_panic() {
@@ -343,7 +344,7 @@ mod test {
         task.run_task();
     }
 
-    /// Test the exection of a not rescheduled failed task.
+    /// Test the execution of a not rescheduled failed task.
     #[test]
     #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
