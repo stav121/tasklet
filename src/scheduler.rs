@@ -34,6 +34,28 @@ impl<'a, T> TaskScheduler<'a, T>
 where
     T: TimeZone + Clone,
 {
+    /// Create a new instance of `TaskSchedule` with default sleep and no tasks to execute.
+    ///
+    /// # Arguments
+    ///
+    /// * timezone - the scheduler's timezone.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskScheduler;
+    /// let _ = TaskScheduler::default(chrono::Utc);
+    /// ```
+    pub fn default(timezone: T) -> TaskScheduler<'a, T> {
+        TaskScheduler {
+            tasks: Vec::new(),
+            task_gen: None,
+            sleep: 1000,
+            timezone,
+            next_id: 0,
+        }
+    }
+
     /// Create a new instance of `TaskScheduler` with no tasks to execute.
     ///
     /// # Arguments
@@ -46,15 +68,12 @@ where
     /// ```
     /// # use tasklet::TaskScheduler;
     /// // Create a new `TaskScheduler` instance that executes every 1000ms.
-    /// let _schedule = TaskScheduler::new(1000, chrono::Local);
+    /// let _ = TaskScheduler::new(1000, chrono::Local);
     /// ```
     pub fn new(sleep: usize, timezone: T) -> TaskScheduler<'a, T> {
         TaskScheduler {
-            tasks: Vec::new(),
-            task_gen: None,
             sleep,
-            timezone,
-            next_id: 0,
+            ..TaskScheduler::default(timezone)
         }
     }
 
@@ -69,7 +88,7 @@ where
     /// ```
     /// # use tasklet::{TaskScheduler, TaskGenerator};
     /// // Create a new `TaskScheduler` instance and attach an `TaskGenerator` to it.
-    /// let mut scheduler = TaskScheduler::new(1000, chrono::Local);
+    /// let mut scheduler = TaskScheduler::default(chrono::Local);
     /// let mut generator = TaskGenerator::new("1 * * * * * *", chrono::Local, || None);
     /// scheduler.set_task_gen(generator);
     /// ```
@@ -89,7 +108,7 @@ where
     /// ```
     /// # use tasklet::{TaskScheduler, Task};
     /// // Create a new `TaskScheduler` and attach a task to it.
-    /// let mut scheduler = TaskScheduler::new(1000, chrono::Local);
+    /// let mut scheduler = TaskScheduler::default(chrono::Local);
     /// // Add a task that executes every second forever.
     /// scheduler.add_task(Task::new("* * * * * * *", None, None, chrono::Local));
     /// ```
@@ -98,7 +117,7 @@ where
         self
     }
 
-    /// Execute all the statuses in the queue.
+    /// Execute all the tasks in the queue.
     /// After the execution the tasks are rescheduled and if needed,
     /// removed from the list.
     pub(crate) fn execute_tasks(&mut self) -> ExecutionStatus {

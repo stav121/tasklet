@@ -12,17 +12,17 @@
 
 ## Dependencies
 
-* cron (0.12.0)
-* chrono (0.4.31)
-* time (0.3.31)
-* log (0.4.20)
+* cron (0.12.1)
+* chrono (0.4.38)
+* time (0.3.36)
+* log (0.4.21)
 
 ## Use this library
 
 In your `Cargo.toml` add:
 ```
 [dependencies]
-tasklet = "0.1.4"
+tasklet = "0.1.5"
 ```
 
 ## Example
@@ -41,8 +41,8 @@ fn main() {
     // A variable to be passed in the task.
     let mut exec_count = 0;
 
-    // Task scheduler with 2000ms loop frequency.
-    let mut scheduler = TaskScheduler::new(2000, chrono::Local);
+    // Task scheduler with 1000ms loop frequency.
+    let mut scheduler = TaskScheduler::default(chrono::Local);
 
     // Create a task with 2 steps and add it to the scheduler.
     // The second step fails every second execution.

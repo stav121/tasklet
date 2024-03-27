@@ -23,8 +23,9 @@ pub struct TaskStep<'a> {
 /// - Failed    => The task has executed but has failed.
 /// - Executed  => The task has executed successfully.
 /// - Finished  => The task has finished and can be removed from the queue.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub enum Status {
+    #[default]
     Init,
     Scheduled,
     Failed,
@@ -97,7 +98,7 @@ where
             repeats,
             timezone,
             task_id: 0,
-            status: Status::Init,
+            status: Status::default(),
             next_exec: None,
         }
     }

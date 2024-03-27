@@ -2,8 +2,8 @@ use log::{error, info};
 use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskScheduler};
 
-/// A simple example of a task with two step,
-/// that might work or fail some times.
+/// A simple example of a task with two steps,
+/// that might work or fail depending on the execution configuration.
 fn main() {
     // Init the logger.
     SimpleLogger::new().init().unwrap();
@@ -29,12 +29,11 @@ fn main() {
                 if exec_count % 2 == 0 {
                     error!("Oh no this step failed!");
                     exec_count += 1;
-                    Err(()) // Indicate that this step was a fail.
-                } else {
-                    info!("Hello from step 2");
-                    exec_count += 1;
-                    Ok(()) // Indicate that this step was a success.
+                    return Err(()); // Indicate that this step was a fail.
                 }
+                info!("Hello from step 2");
+                exec_count += 1;
+                Ok(()) // Indicate that this step was a success.
             })
             .build(),
     );
