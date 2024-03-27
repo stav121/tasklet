@@ -1,20 +1,20 @@
 [package]
 name = "tasklet"
-version = "0.1.4"
+version = "0.1.5"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT"
-repositoy = "https://github.com/stav121/tasklet"
+repository = "https://github.com/stav121/tasklet"
 readme = "README.md"
 description = "A task scheduling library."
 keywords = ["cron", "scheduling", "tasks", "tasklet"]
 
 [dependencies]
-cron = "0.12.0"
-chrono = "0.4.31"
-time = "0.3.31"
-log = "0.4.20"
+cron = "0.12.1"
+chrono = "0.4.38"
+time = "0.3.36"
+log = "0.4.21"
 
 [dev-dependencies]
 simple_logger = "4.3.3"

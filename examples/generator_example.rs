@@ -10,7 +10,7 @@ fn main() {
     SimpleLogger::new().init().unwrap();
 
     // Create a `TaskScheduler` instance.
-    let mut scheduler = TaskScheduler::new(500, Utc);
+    let mut scheduler = TaskScheduler::default(Utc);
     // Add a new `TaskGenerator` instance that generates a task
     // that leaves for 2 seconds, at the start of each minute.
     scheduler.set_task_gen(TaskGenerator::new("1 * * * * * *", Utc, || {
