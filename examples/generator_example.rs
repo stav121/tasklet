@@ -5,7 +5,8 @@ use tasklet::{TaskBuilder, TaskGenerator, TaskScheduler};
 
 /// This examples shows how to use a (not so usefully) `TaskGenerator`
 /// to generate new tasks for the a `TaskScheduler`.
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize the logger.
     SimpleLogger::new().init().unwrap();
 
@@ -36,5 +37,5 @@ fn main() {
     }));
 
     // Execute the scheduler.
-    scheduler.run();
+    scheduler.run().await;
 }

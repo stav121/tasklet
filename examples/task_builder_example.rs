@@ -2,8 +2,10 @@ use chrono::Utc;
 use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskScheduler};
 
-/// An example of a `TaskScheduler` instance with one`Task` instance.
-fn main() {
+/// An example of a `TaskScheduler` instance with one`Task` instance
+/// that is executed exactly 5 times and then removed from the schedule.
+#[tokio::main]
+async fn main() {
     // Initialize the logger.
     SimpleLogger::new().init().unwrap();
 
@@ -22,5 +24,5 @@ fn main() {
     );
 
     // Execute the scheduler.
-    scheduler.run();
+    scheduler.run().await;
 }

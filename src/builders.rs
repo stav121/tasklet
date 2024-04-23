@@ -5,14 +5,14 @@ use cron::Schedule;
 /// Task builder function.
 ///
 /// Used to generate/build a `TaskStep` instance.
-pub struct TaskBuilder<'a, T>
+pub struct TaskBuilder<T>
 where
-    T: TimeZone,
+    T: TimeZone + Send + 'static,
 {
     /// An optional task description.
     description: Option<String>,
     /// The provided `TaskStep` vector.
-    steps: Vec<TaskStep<'a>>,
+    steps: Vec<TaskStep>,
     /// The provided `Schedule`, if not given,
     /// it will be defaulted to once every hour.
     schedule: Option<Schedule>,
@@ -22,9 +22,9 @@ where
     timezone: T,
 }
 
-impl<'a, T> TaskBuilder<'a, T>
+impl<T> TaskBuilder<T>
 where
-    T: TimeZone,
+    T: TimeZone + Send + 'static,
 {
     /// Create a new `TaskBuilder` instance.
     ///
@@ -38,7 +38,7 @@ where
     /// # use tasklet::TaskBuilder;
     /// let _task_builder = TaskBuilder::new(chrono::Utc);
     /// ```
-    pub fn new(timezone: T) -> TaskBuilder<'a, T> {
+    pub fn new(timezone: T) -> TaskBuilder<T> {
         TaskBuilder {
             steps: Vec::new(),
             description: None,
@@ -58,7 +58,7 @@ where
     /// # use tasklet::TaskBuilder;
     /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").description("Description").build();
     /// ```
-    pub fn description(mut self, description: &str) -> TaskBuilder<'a, T> {
+    pub fn description(mut self, description: &str) -> TaskBuilder<T> {
         self.description = Some(description.to_string());
         self
     }
@@ -75,7 +75,7 @@ where
     /// # use tasklet::{TaskBuilder, Task};
     /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").build();
     /// ```
-    pub fn every(mut self, expression: &str) -> TaskBuilder<'a, T> {
+    pub fn every(mut self, expression: &str) -> TaskBuilder<T> {
         self.schedule = Some(expression.parse().unwrap());
         self
     }
@@ -92,7 +92,7 @@ where
     /// # use tasklet::TaskBuilder;
     /// let _task = TaskBuilder::new(chrono::Local).repeat(5);
     /// ```
-    pub fn repeat(mut self, repeat: usize) -> TaskBuilder<'a, T> {
+    pub fn repeat(mut self, repeat: usize) -> TaskBuilder<T> {
         self.repeats = Some(repeat);
         self
     }
@@ -111,9 +111,9 @@ where
     /// let _task = TaskBuilder::new(chrono::Local).add_step(None, || Ok(()));
     /// let _task = TaskBuilder::new(chrono::Utc).add_step(Some("A step that fails."), || Err(()));
     /// ```
-    pub fn add_step<F>(mut self, description: Option<&str>, function: F) -> TaskBuilder<'a, T>
+    pub fn add_step<F>(mut self, description: Option<&str>, function: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Result<(), ()>) + 'a,
+        F: (FnMut() -> Result<(), ()>) + Send + 'static,
     {
         self.steps.push(TaskStep {
             function: Box::new(function),
@@ -133,7 +133,7 @@ where
     /// # use tasklet::{TaskBuilder, Task};
     /// let mut _task = TaskBuilder::new(chrono::Utc).build();
     /// ```
-    pub fn build(self) -> Task<'a, T> {
+    pub fn build(self) -> Task<T> {
         let mut task = Task::new(
             "* * * * * * *",
             match self.description {
