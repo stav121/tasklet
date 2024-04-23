@@ -3,7 +3,8 @@ use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskScheduler};
 
 /// An example of a `TaskScheduler` instance with 2 `Task` instances.
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize the logger.
     SimpleLogger::new().init().unwrap();
 
@@ -42,5 +43,5 @@ fn main() {
         );
 
     // Execute the tasks in the queue.
-    scheduler.run();
+    scheduler.run().await;
 }

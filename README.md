@@ -1,32 +1,45 @@
-![](tasklet-logo.png)
+<p align="center">
+    <img src="tasklet-logo.png">
+</p>
 
-[![CircleCI](https://circleci.com/gh/stav121/tasklet.svg?style=shield)](https://circleci.com/gh/stav121/tasklet)
-![Crates.io](https://img.shields.io/crates/d/tasklet)
-![Crates.io](https://img.shields.io/crates/v/tasklet)
-![GitHub last commit](https://img.shields.io/github/last-commit/stav121/tasklet)
-[![codecov](https://codecov.io/gh/stav121/tasklet/branch/main/graph/badge.svg?token=HBIQJYK1EU)](https://codecov.io/gh/stav121/tasklet)
-![License](https://img.shields.io/github/license/stav121/tasklet)
-[![GitHub issues](https://img.shields.io/github/issues/stav121/tasklet)](https://github.com/stav121/tasklet/issues)
+[![CircleCI](https://img.shields.io/circleci/build/github/stav121/tasklet?style=for-the-badge&logo=circleci)](https://circleci.com/gh/stav121/tasklet)
+![Crates.io](https://img.shields.io/crates/d/tasklet?style=for-the-badge&color=blue&logo=owncloud)
+![Crates.io](https://img.shields.io/crates/v/tasklet?style=for-the-badge&color=orange&logo=rust)
+![GitHub last commit](https://img.shields.io/github/last-commit/stav121/tasklet?style=for-the-badge&color=purple&logo=git&logoColor=white)
+[![Codecov](https://img.shields.io/codecov/c/github/stav121/tasklet?style=for-the-badge&logo=codecov&logoColor=white)](https://codecov.io/gh/stav121/tasklet)
+![License](https://img.shields.io/github/license/stav121/tasklet?style=for-the-badge&color=lightgrey&logo=amazoniam&logoColor=white)
+[![GitHub issues](https://img.shields.io/github/issues/stav121/tasklet?style=for-the-badge&color=yellow&logo=github)](https://github.com/stav121/tasklet/issues)
 
-⏱️ A task scheduling library written in Rust
+⏱️ An asynchronous task scheduling library written in Rust
+
+## About
+
+`tasklet` is a task scheduling library written in Rust. It is built over `tokio` runtime and utilizes green threads
+in order to run tasks asynchronously.
 
 ## Dependencies
 
-* cron (0.12.1)
-* chrono (0.4.38)
-* time (0.3.36)
-* log (0.4.21)
+| library | version |
+|---------|---------|
+| cron    | 0.12.1  |
+| chrono  | 0.4.38  |
+| time    | 0.3.36  |
+| log     | 0.4.21  |
+| tokio   | 1.37.0  |
 
-## Use this library
+## How to use this library
 
 In your `Cargo.toml` add:
+
 ```
 [dependencies]
-tasklet = "0.1.5"
+tasklet = "0.2.0"
 ```
 
 ## Example
+
 Find more examples in the [examples](/examples) folder.
+
 ```rust
 use log::{error, info};
 use simple_logger::SimpleLogger;
@@ -34,7 +47,8 @@ use tasklet::{TaskBuilder, TaskScheduler};
 
 /// A simple example of a task with two step,
 /// that might work or fail some times.
-fn main() {
+#[tokio::main]
+async fn main() {
     // Init the logger.
     SimpleLogger::new().init().unwrap();
 
@@ -70,7 +84,7 @@ fn main() {
     );
 
     // Execute the scheduler.
-    scheduler.run();
+    scheduler.run().await;
 }
 ```
 

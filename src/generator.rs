@@ -10,12 +10,12 @@ use log::debug;
 ///
 /// It is run in the given interval, and if a new task is generated,
 /// then it is appended in the list of tasks to be executed.
-pub struct TaskGenerator<'a, T>
+pub struct TaskGenerator<T>
 where
-    T: TimeZone,
+    T: TimeZone + Send + 'static,
 {
     /// The discovery function, used to retrieve new tasks.
-    discovery_function: Box<dyn (FnMut() -> Option<Task<'a, T>>) + 'a>,
+    discovery_function: Box<dyn (FnMut() -> Option<Task<T>>)>,
     /// The execution schedule.
     schedule: Schedule,
     /// The task generator's timezone.
@@ -25,9 +25,9 @@ where
 }
 
 /// Implementation of `TaskGenerator`.
-impl<'a, T> TaskGenerator<'a, T>
+impl<T> TaskGenerator<T>
 where
-    T: TimeZone + Clone,
+    T: TimeZone + Clone + Send + 'static,
 {
     /// Create a new `TaskGenerator` instance.
     ///
@@ -45,9 +45,9 @@ where
     /// // It will be executed at the first second of each minute.
     /// let _task_gen = TaskGenerator::new("1 * * * * * *", chrono::Local, || Some(Task::new("* * * * * * *", None, None, chrono::Local)));
     /// ```
-    pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskGenerator<'a, T>
+    pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskGenerator<T>
     where
-        F: (FnMut() -> Option<Task<'a, T>>) + 'a,
+        F: (FnMut() -> Option<Task<T>>) + 'static,
     {
         let schedule: Schedule = expression.parse().unwrap();
 
@@ -60,7 +60,7 @@ where
     }
 
     /// Run the discovery function and reschedule the generation function.
-    pub(crate) fn run(&mut self) -> Option<Task<'a, T>> {
+    pub(crate) fn run(&mut self) -> Option<Task<T>> {
         debug!("Executing discovery function.");
         self.next_exec = self
             .schedule
