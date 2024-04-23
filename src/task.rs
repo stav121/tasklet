@@ -1,45 +1,74 @@
 extern crate chrono;
 extern crate cron;
 
-use chrono::DateTime;
+use crate::task::Status::Init;
 use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
 use log::{debug, error, warn};
+use tokio::sync::{mpsc, oneshot};
+
+pub type ExecutableFn = dyn FnMut() -> Result<(), ()> + 'static + Send;
 
 /// A task step.
 ///
 /// Contains the executable body and an optional short description.
-pub struct TaskStep<'a> {
+pub struct TaskStep {
     /// The function's body.
-    pub(crate) function: Box<dyn (FnMut() -> Result<(), ()>) + 'a>,
+    pub(crate) function: Box<ExecutableFn>,
     /// An (optional) short description.
     pub(crate) description: String,
 }
 
 /// Available task statuses.
-///
-/// - Init      => The task is not initialized yet.
-/// - Scheduled => The task has been scheduled and pending execution.
-/// - Failed    => The task has executed but has failed.
-/// - Executed  => The task has executed successfully.
-/// - Finished  => The task has finished and can be removed from the queue.
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Default, Clone)]
 pub enum Status {
     #[default]
+    /// The task is not initialized yet.
     Init,
+    /// The task has been scheduled and pending execution.
     Scheduled,
+    /// The task has executed but has failed.
     Failed,
+    /// The task has executed successfully.
     Executed,
+    /// The task has finished and can be removed from the queue
     Finished,
 }
 
+/// A message response from a task
+#[derive(Debug)]
+pub(crate) struct TaskResponse {
+    /// The id of the task as set by the scheduler
+    pub id: usize,
+    /// The status after the request has been fulfilled
+    pub status: Status,
+}
+
+#[derive(Debug)]
+/// Available commands to be sent
+pub(crate) enum TaskCmd {
+    /// Request to initialize the task
+    Init {
+        sender: oneshot::Sender<TaskResponse>,
+    },
+    /// Execute the task
+    Run {
+        sender: oneshot::Sender<TaskResponse>,
+    },
+    /// Request the rescheduling of the task
+    Reschedule {
+        sender: oneshot::Sender<TaskResponse>,
+    },
+}
+
 /// A structure that contains the basic information of the job.
-pub struct Task<'a, T>
+pub struct Task<T>
 where
-    T: TimeZone,
+    T: TimeZone + Send + 'static,
 {
     /// Task's executable tasks.
-    pub(crate) steps: Vec<TaskStep<'a>>,
+    pub(crate) steps: Vec<TaskStep>,
     /// The execution schedule.
     pub(crate) schedule: Schedule,
     /// Total number of executions, if `None` then it will run forever.
@@ -54,12 +83,15 @@ where
     pub(crate) next_exec: Option<DateTime<T>>,
     /// (Internal) task status.
     pub(crate) status: Status,
+    /// Task receiver
+    pub(crate) receiver: Option<mpsc::Receiver<TaskCmd>>,
 }
 
-/// `Task` implementation.
-impl<'a, T> Task<'a, T>
+unsafe impl<T> Send for Task<T> where T: TimeZone + Send + 'static {}
+
+impl<T> Task<T>
 where
-    T: TimeZone,
+    T: TimeZone + Send + 'static,
 {
     /// Create a new instance of type `Task`.
     ///
@@ -87,7 +119,7 @@ where
         description: Option<&str>,
         repeats: Option<usize>,
         timezone: T,
-    ) -> Task<'a, T> {
+    ) -> Task<T> {
         Task {
             steps: Vec::new(),
             schedule: expression.parse().unwrap(),
@@ -100,7 +132,16 @@ where
             task_id: 0,
             status: Status::default(),
             next_exec: None,
+            receiver: None,
         }
+    }
+
+    pub(crate) fn set_receiver(&mut self, receiver: mpsc::Receiver<TaskCmd>) {
+        self.receiver = Some(receiver);
+    }
+
+    pub fn set_id(&mut self, id: usize) {
+        self.task_id = id;
     }
 
     /// Add a new `TaskStep` in the `Task`.
@@ -110,9 +151,9 @@ where
     /// * description   - A short task step description (Optional).
     /// * function      - The executable function.
     #[cfg(test)]
-    pub(crate) fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<'a, T>
+    pub(crate) fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Result<(), ()>) + 'a,
+        F: (FnMut() -> Result<(), ()>) + 'static + Send,
     {
         self.steps.push(TaskStep {
             function: Box::new(function),
@@ -129,7 +170,7 @@ where
     /// # Arguments
     ///
     /// * steps   - A vector that contains the executable steps.
-    pub(crate) fn set_steps(&mut self, steps: Vec<TaskStep<'a>>) -> &mut Task<'a, T> {
+    pub(crate) fn set_steps(&mut self, steps: Vec<TaskStep>) -> &mut Task<T> {
         self.steps = steps;
         self
     }
@@ -139,7 +180,7 @@ where
     /// # Arguments
     ///
     /// * schedule  - The schedule.
-    pub(crate) fn set_schedule(&mut self, schedule: Schedule) -> &mut Task<'a, T> {
+    pub(crate) fn set_schedule(&mut self, schedule: Schedule) -> &mut Task<T> {
         self.schedule = schedule;
         self
     }
@@ -149,8 +190,8 @@ where
     /// # Arguments
     ///
     /// * id - The task's id.
-    pub(crate) fn init(&mut self, id: usize) {
-        self.task_id = id;
+    pub(crate) fn init(&mut self) {
+        debug!("Task with id {} is initializing.", self.task_id);
         self.next_exec = Some(
             self.schedule
                 .upcoming(self.timezone.clone())
@@ -158,6 +199,43 @@ where
                 .unwrap(),
         );
         self.status = Status::Scheduled;
+        debug!("Task with id {} finished initializing.", self.task_id);
+    }
+
+    /// Create a `TaskResponse` from the current state of the task.
+    fn get_task_response(&self) -> TaskResponse {
+        TaskResponse {
+            id: self.task_id,
+            status: self.status.clone(),
+        }
+    }
+
+    /// Execute a command sent by the scheduler.
+    ///
+    /// Each of the commands triggers the underlying method of the task,
+    /// and responds with the id of the task and the status of the task after the execution
+    /// of the command has finished.
+    pub(crate) fn execute_command(&mut self, msg: TaskCmd) {
+        match msg {
+            TaskCmd::Run { sender } => {
+                if self.next_exec.as_ref().unwrap()
+                    <= &Utc::now().with_timezone(&self.timezone.clone())
+                {
+                    self.run_task();
+                }
+                let _ = sender.send(self.get_task_response());
+            }
+            TaskCmd::Reschedule { sender } => {
+                self.reschedule();
+                let _ = sender.send(self.get_task_response());
+            }
+            TaskCmd::Init { sender } => {
+                if self.status == Init {
+                    self.init();
+                }
+                let _ = sender.send(self.get_task_response());
+            }
+        }
     }
 
     /// Run the task and handle the output.
@@ -242,20 +320,34 @@ where
     }
 }
 
-/// Module tests
+/// Wrap a `Task` around a receiver, each time a command is received, forward it to the task.
+pub(crate) async fn run_task<T>(mut task: Task<T>)
+where
+    T: TimeZone + Send + 'static,
+{
+    while let Some(msg) = task
+        .receiver
+        .as_mut()
+        .expect("Failed to borrow receiver.")
+        .recv()
+        .await
+    {
+        task.execute_command(msg);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use chrono::prelude::*;
 
-    /// Test the normal execution of a simple task.
-    /// Verify the status changes.
     #[test]
     fn normal_task_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
         task.add_step(None, || Ok(()));
         assert_eq!(task.status, Status::Init);
-        task.init(0);
+        task.set_id(0);
+        task.init();
         assert_eq!(task.status, Status::Scheduled);
         task.run_task();
         assert_eq!(task.status, Status::Executed);
@@ -267,7 +359,6 @@ mod test {
         assert_eq!(task.status, Status::Finished);
     }
 
-    /// Test the normal execution of the `set_schedule` function.
     #[test]
     fn test_task_set_schedule() {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
@@ -275,18 +366,18 @@ mod test {
         task.set_schedule(schedule);
         task.add_step(None, || Ok(()));
         assert_eq!(task.status, Status::Init);
-        task.init(0);
+        task.set_id(0);
+        task.init();
         assert_eq!(task.status, Status::Scheduled);
     }
 
-    /// Test the normal execution of a simple task.
-    /// Verify the status changes.
     #[test]
     fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
         task.add_step(None, || Err(()));
         assert_eq!(task.status, Status::Init);
-        task.init(0);
+        task.set_id(0);
+        task.init();
         assert_eq!(task.status, Status::Scheduled);
         task.run_task();
         assert_eq!(task.status, Status::Failed);
@@ -304,7 +395,8 @@ mod test {
         let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local);
         task.add_step(None, || Ok(()));
         assert_eq!(task.status, Status::Init);
-        task.init(0);
+        task.set_id(0);
+        task.init();
         assert_eq!(task.status, Status::Scheduled);
         // Run it for a few times.
         for _i in 1..10 {
@@ -315,7 +407,6 @@ mod test {
         }
     }
 
-    /// Test the rescheduling of an uninitialized task.
     #[test]
     #[should_panic(expected = "Task not initialized yet!")]
     fn test_reschedule_init_panic() {
@@ -324,20 +415,19 @@ mod test {
         task.reschedule();
     }
 
-    /// Test the rescheduling of a task that has been marked as finished.
     #[test]
     #[should_panic(expected = "[Task 0] has finished and must be removed!")]
     fn test_reschedule_finished_panic() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
         // Execute the task.
-        task.init(0);
+        task.set_id(0);
+        task.init();
         task.run_task();
         task.reschedule();
         // Try to reschedule after it's finished. It should fail.
         task.reschedule();
     }
 
-    /// Test the execution of an uninitialized task.
     #[test]
     #[should_panic = "Task not initialized yet!"]
     fn test_run_uninitialized_task() {
@@ -345,36 +435,36 @@ mod test {
         task.run_task();
     }
 
-    /// Test the execution of a not rescheduled failed task.
     #[test]
     #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
         task.add_step(None, || Err(()));
-        task.init(0);
+        task.set_id(0);
+        task.init();
         task.run_task();
         // Attempt to rerun it, it should fail.
         task.run_task();
     }
 
-    /// Test the execution of a task that has been run but not rescheduled.
     #[test]
     #[should_panic = "Task already executed and must be rescheduled!"]
     fn test_run_executed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
         task.add_step(None, || Ok(()));
-        task.init(0);
+        task.set_id(0);
+        task.init();
         task.run_task();
         // Attempt to run it again, it should fail.
         task.run_task();
     }
 
-    /// Test the execution of a task that has already finished.
     #[test]
     #[should_panic = "Task has finished and must be removed!"]
     fn test_run_finished_task() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
-        task.init(0);
+        task.set_id(0);
+        task.init();
         task.run_task();
         task.reschedule();
         // At this point the task is Finished. It should not be allowed to run again.
