@@ -1,33 +1,32 @@
 use crate::generator::TaskGenerator;
-use crate::task::Status::Finished;
-use crate::task::{run_task, Task, TaskCmd, TaskResponse};
+use crate::task::{run_task, Status, Task, TaskCmd, TaskResponse};
 use chrono::prelude::*;
 use chrono::Utc;
+use futures::future::join_all;
 use log::{debug, error, info};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Task execution possible statuses.
-#[warn(dead_code)]
 pub(crate) enum ExecutionStatus {
-    Success,
-    HadError(usize),
+    Success(usize),
+    NoExecution,
+    HadError(usize, usize),
 }
 
-#[doc = r#"
-Handler for task threads.
-Contains the join handle and sender for each task.
-
-When a task is finished the handle must be destroyed and sender dropped, in order to totally remove the task from the execution context.
-
-The #id must be set uppon the task initialization in order to be easier to query for later use.
-"#]
+/// Handler for task threads.
+/// Contains the join handle and sender for each task.
+///
+/// When a task is finished the handle must be destroyed and sender dropped, in order to totally remove the task from the execution context.
+///
+/// The #id must be set upon the task initialization in order to be easier to query for later use.
 #[derive(Debug)]
 pub struct TaskHandle {
     id: usize,
     handle: JoinHandle<()>,
     sender: mpsc::Sender<TaskCmd>,
+    is_init: bool,
 }
 
 /// Task scheduler and executor.
@@ -67,7 +66,7 @@ where
     pub fn default(timezone: T) -> TaskScheduler<T> {
         TaskScheduler {
             handles: Vec::new(),
-            /* Original empty, no registered tasks. */
+            /* Originally empty, no registered tasks. */
             task_gen: None,
             sleep: 1000,
             timezone,
@@ -145,6 +144,7 @@ where
             id: self.next_id,
             handle,
             sender,
+            is_init: false,
         });
 
         // Increase the id of the next task.
@@ -153,108 +153,116 @@ where
     }
 
     /// Execute all the tasks in the queue.
+    ///
     /// After the execution the tasks are rescheduled and if needed,
     /// removed from the list.
     pub(crate) async fn execute_tasks(&mut self) -> ExecutionStatus {
-        let mut recvrs: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
+        let mut receivers: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
 
         for handle in &self.handles {
             let (send, recv) = oneshot::channel();
-
             let msg = TaskCmd::Run { sender: send };
-
             let _ = handle.sender.send(msg).await;
-            recvrs.push(recv);
+            receivers.push(recv);
         }
 
-        for recv in recvrs {
-            let _ = recv.await;
+        let mut err_no: usize = 0;
+        let mut total_runs: usize = 0;
+        for recv in receivers {
+            let task_response = recv.await;
+            let task_response = task_response.unwrap();
+            match task_response.status {
+                Status::Executed => {
+                    total_runs += 1;
+                }
+                Status::Failed => {
+                    err_no += 1;
+                    total_runs += 1;
+                }
+                _ => {}
+            }
         }
 
-        let mut recvrs: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
-
+        // Send for reschedule
+        receivers = Vec::new();
         for handle in &self.handles {
             let (send, recv) = oneshot::channel();
 
             let msg = TaskCmd::Reschedule { sender: send };
 
             let _ = handle.sender.send(msg).await;
-            recvrs.push(recv);
+            receivers.push(recv);
         }
 
-        for recv in recvrs {
+        for recv in receivers {
             let res = recv.await;
             let res1 = res.unwrap();
-            if res1.status == Finished {
-                for handle in &self.handles {
-                    if handle.id == res1.id {
-                        debug!("Killing task {} due to end of execution circle.", res1.id);
-                        handle.handle.abort();
+            match res1.status {
+                Status::Finished => {
+                    for handle in &self.handles {
+                        if handle.id == res1.id {
+                            debug!("Killing task {} due to end of execution circle.", res1.id);
+                            handle.handle.abort();
+                        }
                     }
+                    let index = self.handles.iter().position(|x| x.id == res1.id).unwrap();
+                    self.handles.remove(index);
                 }
-                let index = self.handles.iter().position(|x| x.id == res1.id).unwrap();
-                self.handles.remove(index);
+                // TODO: Handle different types of errors here
+                _ => {}
             }
         }
 
-        ExecutionStatus::Success
-
-        // Ids of the tasks to be removed at the end of iterations.
-        // let mut finished_ids: Vec<usize> = Vec::new();
-        // let total = self.tasks.len();
-        // let mut err_count: usize = 0;
-        //
-        // for (index, task) in self.tasks.iter_mut().enumerate() {
-        //     if task.next_exec.as_ref().unwrap() <= &Utc::now().with_timezone(&self.timezone.clone())
-        //     {
-        //         debug!("Executing task {} ({}/{})", task.task_id, index + 1, total);
-        //         task.run_task();
-        //         if task.status == Status::Failed {
-        //             err_count += 1;
-        //         }
-        //         task.reschedule();
-        //         if task.status == Status::Finished {
-        //             finished_ids.push(index);
-        //         }
-        //     }
-        // }
-        //
-        // // Clean if needed.
-        // for index in finished_ids {
-        //     self.tasks.remove(index);
-        //     warn!("Task {} has finished and is removed.", index);
-        // }
-        //
-        // if err_count > 0 {
-        //     ExecutionStatus::HadError(err_count)
-        // } else {
-        //     ExecutionStatus::Success
-        // }
+        // Build the response
+        if total_runs > 0 {
+            if err_no == 0 {
+                ExecutionStatus::Success(total_runs)
+            } else {
+                ExecutionStatus::HadError(total_runs, err_no)
+            }
+        } else {
+            ExecutionStatus::NoExecution
+        }
     }
 
-    /// Initialize all the tasks.
-    pub(crate) async fn init(&mut self) {
-        debug!("Initializing {} task(s).", self.handles.len());
+    /// Send an init signal to all the tasks that are not yet initialized.
+    pub(crate) async fn init_tasks(&mut self) {
+        let mut receivers: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
+        let mut count: usize = 0;
 
-        let mut recvrs: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
-
+        // Send init signal to all the tasks that are not initialized yet.
         for handle in &self.handles {
-            let (send, recv) = oneshot::channel();
-
-            let msg = TaskCmd::Init { sender: send };
-            let _ = handle.sender.send(msg).await;
-
-            recvrs.push(recv);
+            if !handle.is_init {
+                let (send, recv) = oneshot::channel();
+                let msg = TaskCmd::Init { sender: send };
+                let _ = handle.sender.send(msg).await;
+                receivers.push(recv);
+                count += 1;
+            }
         }
 
-        for recv in recvrs {
-            let _ = recv.await;
+        if count > 0 {
+            // Await for all receivers to finish
+            join_all(receivers).await.iter().for_each(|r| match r {
+                Ok(r) => match r.status {
+                    Status::Scheduled => {
+                        self.handles
+                            .iter_mut()
+                            .filter(|h| h.id == r.id)
+                            .for_each(|h| {
+                                info!("Task with id {} initialized.", h.id);
+                                h.is_init = true;
+                            });
+                    }
+                    _ => {
+                        error!("Task with id {} failed to initialize.", r.id);
+                    }
+                },
+                Err(_) => {
+                    error!("RecvError returned by at least one uninitialized task.")
+                }
+            });
         }
-
-        debug!(
-            "Initialization finished for {} tasks(s).",
-            self.handles.len()
-        );
     }
 
     /// Execute the `TaskGenerator` instance (if set).
@@ -280,27 +288,36 @@ where
     }
 
     /// Main execution loop.
+    ///
+    /// Executes the main flow of the scheduler.
+    /// At first initialize all the tasks and then run the execution loop.
+    ///
+    /// If there is a task generation/discovery method provided, executed on every loop.
     pub async fn run(&mut self) {
         info!(
             "Scheduler started. Total tasks currently in queue: {}",
             self.handles.len()
         );
 
-        self.init().await;
+        // Initialize the tasks
+        self.init_tasks().await;
 
         loop {
             if self.run_task_gen() {
                 // Re-initialize the tasks if any new is added
-                self.init().await;
+                self.init_tasks().await;
             }
             match self.execute_tasks().await {
-                ExecutionStatus::Success => {
-                    // TODO: Check if at least one was executed or add new status NonExecuted
-                    // info!("Execution round had no errors");
+                ExecutionStatus::Success(c) => {
+                    info!("Execution round run successfully for {} total tasks", c);
                 }
-                ExecutionStatus::HadError(e) => {
-                    error!("Execution round had {} errors.", e);
+                ExecutionStatus::HadError(c, e) => {
+                    error!(
+                        "Execution round executed {} total tasks and had {} total errors.",
+                        c, e
+                    );
                 }
+                _ => { /* No executions */ }
             }
             tokio::time::sleep(Duration::from_millis(self.sleep as u64)).await;
         }
@@ -324,7 +341,7 @@ mod test {
             .add_task(Task::new("* * * * * * *", None, None, Local));
         assert_eq!(scheduler.handles.len(), 2);
         // Initialize the tasks.
-        scheduler.init().await;
+        scheduler.init_tasks().await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
         scheduler.execute_tasks().await;
         assert_eq!(scheduler.handles.len(), 2);
@@ -340,15 +357,15 @@ mod test {
 
         // Create a task.
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
-        task.add_step(None, || Ok(()));
+        task.add_step_default(|| Ok(()));
         // Return an error in the second step.
-        task.add_step(None, || Err(()));
+        task.add_step_default(|| Err(()));
 
         // Add a task.
         scheduler.add_task(task);
         assert_eq!(scheduler.handles.len(), 1);
         // Initialize the task.
-        scheduler.init().await;
+        scheduler.init_tasks().await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
         scheduler.execute_tasks().await;
         // The task should be removed after it's execution circle.

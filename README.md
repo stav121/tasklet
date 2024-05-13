@@ -33,7 +33,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.2.0"
+tasklet = "0.2.1"
 ```
 
 ## Example
@@ -45,8 +45,8 @@ use log::{error, info};
 use simple_logger::SimpleLogger;
 use tasklet::{TaskBuilder, TaskScheduler};
 
-/// A simple example of a task with two step,
-/// that might work or fail some times.
+/// A simple example of a task with two steps,
+/// that might work or fail sometimes.
 #[tokio::main]
 async fn main() {
     // Init the logger.
@@ -65,11 +65,11 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step(None, || {
+            .add_step_default(|| {
                 info!("Hello from step 1");
                 Ok(()) // Let the scheduler know this step was a success.
             })
-            .add_step(None, move || {
+            .add_step_default(move || {
                 if exec_count % 2 == 0 {
                     error!("Oh no this step failed!");
                     exec_count += 1;

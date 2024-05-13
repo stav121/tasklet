@@ -1,7 +1,7 @@
 mod builders;
 mod generator;
 mod scheduler;
-mod task;
+pub mod task;
 
 pub use builders::TaskBuilder;
 pub use generator::TaskGenerator;

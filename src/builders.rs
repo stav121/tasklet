@@ -108,20 +108,31 @@ where
     ///
     /// ```rust
     /// # use tasklet::TaskBuilder;
-    /// let _task = TaskBuilder::new(chrono::Local).add_step(None, || Ok(()));
-    /// let _task = TaskBuilder::new(chrono::Utc).add_step(Some("A step that fails."), || Err(()));
+    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || Err(()));
     /// ```
-    pub fn add_step<F>(mut self, description: Option<&str>, function: F) -> TaskBuilder<T>
+    pub fn add_step<F>(mut self, description: &str, function: F) -> TaskBuilder<T>
     where
         F: (FnMut() -> Result<(), ()>) + Send + 'static,
     {
-        self.steps.push(TaskStep {
-            function: Box::new(function),
-            description: match description {
-                Some(s) => s.to_string(),
-                None => "-".to_string(),
-            },
-        });
+        self.steps.push(TaskStep::new(description, function));
+        self
+    }
+
+    /// Add a new step to the generated task (without description).
+    ///
+    /// # Arguments
+    ///
+    /// * function  - The executable body of the task's step.
+    ///
+    /// ```
+    /// # use tasklet::TaskBuilder;
+    /// let _ = TaskBuilder::new(chrono::Local).add_step_default(|| Ok(()));
+    /// ```
+    pub fn add_step_default<F>(mut self, function: F) -> TaskBuilder<T>
+    where
+        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+    {
+        self.steps.push(TaskStep::default(function));
         self
     }
 
@@ -221,7 +232,7 @@ mod test {
     /// Test the normal functionality of the add_step() function of the `TaskBuilder`.
     #[test]
     pub fn test_task_builder_add_step() {
-        let builder = TaskBuilder::new(chrono::Utc).add_step(None, || Ok(()));
+        let builder = TaskBuilder::new(chrono::Utc).add_step_default(|| Ok(()));
         assert_none!(builder.schedule, builder.repeats, builder.description);
         assert_eq!(builder.timezone, chrono::Utc);
         assert_eq!(builder.steps.len(), 1);
@@ -234,7 +245,7 @@ mod test {
             .every("* * * * * * *")
             .repeat(5)
             .description("Some description")
-            .add_step(Some("Step 1"), || Ok(()))
+            .add_step("Step 1", || Ok(()))
             .build();
         assert_some!(task.repeats);
         assert_eq!(task.description, "Some description");
@@ -247,7 +258,7 @@ mod test {
     pub fn test_task_builder_build_default() {
         let task = TaskBuilder::new(chrono::Utc)
             .repeat(5)
-            .add_step(Some("Step 1"), || Ok(()))
+            .add_step("Step 1", || Ok(()))
             .build();
         assert_some!(task.repeats);
         assert_eq!(task.timezone, chrono::Utc);
