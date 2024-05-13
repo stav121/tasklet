@@ -24,11 +24,11 @@ async fn main() {
                 .every("0,10,20,30,40,50 * * * * * *")
                 .description("Generated task")
                 .repeat(2)
-                .add_step(None, || {
+                .add_step_default(|| {
                     info!("[Step 1] This is a generated task!");
                     Ok(())
                 })
-                .add_step(None, || {
+                .add_step_default(|| {
                     info!("[Step 2] This is generated task!");
                     Ok(())
                 })

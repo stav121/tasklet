@@ -8,6 +8,7 @@ use cron::Schedule;
 use log::{debug, error, warn};
 use tokio::sync::{mpsc, oneshot};
 
+/// An executable function.
 pub type ExecutableFn = dyn FnMut() -> Result<(), ()> + 'static + Send;
 
 /// A task step.
@@ -17,7 +18,55 @@ pub struct TaskStep {
     /// The function's body.
     pub(crate) function: Box<ExecutableFn>,
     /// An (optional) short description.
-    pub(crate) description: String,
+    pub(crate) description: Option<String>,
+}
+
+impl TaskStep {
+    /// Default constructor.
+    ///
+    /// # Arguments
+    ///
+    /// * description   - a description for the task step
+    /// * function      - the executable body of the function
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::task::TaskStep;
+    /// let _ = TaskStep::new("Some task", || Ok(()));
+    /// ```
+    pub fn new<F>(description: &str, function: F) -> Self
+    where
+        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+    {
+        Self {
+            description: Some(description.to_string()),
+            function: Box::new(function),
+        }
+    }
+
+    /// Default constructor for a task step without a provided description.
+    ///
+    /// # Arguments
+    ///
+    /// *function -> the executable function body
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::task::TaskStep;
+    ///
+    /// let _ = TaskStep::default(|| {Ok(())});
+    /// ```
+    pub fn default<F>(function: F) -> Self
+    where
+        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+    {
+        Self {
+            function: Box::new(function),
+            description: None,
+        }
+    }
 }
 
 /// Available task statuses.
@@ -151,17 +200,25 @@ where
     /// * description   - A short task step description (Optional).
     /// * function      - The executable function.
     #[cfg(test)]
-    pub(crate) fn add_step<F>(&mut self, description: Option<&str>, function: F) -> &mut Task<T>
+    pub(crate) fn add_step<F>(&mut self, description: &str, function: F) -> &mut Task<T>
     where
         F: (FnMut() -> Result<(), ()>) + 'static + Send,
     {
-        self.steps.push(TaskStep {
-            function: Box::new(function),
-            description: match description {
-                Some(s) => s.to_string(),
-                None => "-".to_string(),
-            },
-        });
+        self.steps.push(TaskStep::new(description, function));
+        self
+    }
+
+    /// Add a new `TaskStep` in the `Task` without a provided name/description.
+    ///
+    /// # Arguments
+    ///
+    /// * function  - the executable function
+    #[cfg(test)]
+    pub(crate) fn add_step_default<F>(&mut self, function: F) -> &mut Task<T>
+    where
+        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+    {
+        self.steps.push(TaskStep::default(function));
         self
     }
 
@@ -256,14 +313,14 @@ where
                         match (step.function)() {
                             Ok(_) => {
                                 debug!(
-                                    "[Task {}-{}] [{}] Executed successfully.",
+                                    "[Task {}-{}] [{:?}] Executed successfully.",
                                     self.task_id, index, step.description,
                                 );
                                 self.status = Status::Executed
                             }
                             Err(_) => {
                                 error!(
-                                    "[Task {}]  [{}] Execution failed at step {}.",
+                                    "[Task {}-{}]  [{:?}] Execution failed.",
                                     self.task_id, index, step.description,
                                 );
                                 // Indicate that there was an error.
@@ -305,7 +362,7 @@ where
                             Status::Scheduled
                         } else {
                             warn!(
-                                "[Task  {}] Has finished it's execution cycle and will be removed.",
+                                "[Task  {}] Has finished its execution cycle and will be removed.",
                                 self.task_id
                             );
                             Status::Finished
@@ -344,7 +401,7 @@ mod test {
     #[test]
     fn normal_task_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
-        task.add_step(None, || Ok(()));
+        task.add_step_default(|| Ok(()));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -364,7 +421,7 @@ mod test {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
         let mut task = Task::new("* * * * * * *", None, None, Local);
         task.set_schedule(schedule);
-        task.add_step(None, || Ok(()));
+        task.add_step_default(|| Ok(()));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -374,7 +431,7 @@ mod test {
     #[test]
     fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
-        task.add_step(None, || Err(()));
+        task.add_step_default(|| Err(()));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -393,7 +450,7 @@ mod test {
     #[test]
     fn normal_task_no_fixed_repeats_test() {
         let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local);
-        task.add_step(None, || Ok(()));
+        task.add_step_default(|| Ok(()));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -439,7 +496,7 @@ mod test {
     #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.add_step(None, || Err(()));
+        task.add_step_default(|| Err(()));
         task.set_id(0);
         task.init();
         task.run_task();
@@ -451,7 +508,7 @@ mod test {
     #[should_panic = "Task already executed and must be rescheduled!"]
     fn test_run_executed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.add_step(None, || Ok(()));
+        task.add_step("Step 1", || Ok(()));
         task.set_id(0);
         task.init();
         task.run_task();
