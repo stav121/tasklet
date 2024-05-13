@@ -18,8 +18,8 @@ async fn main() {
             .every("* * * * * *")
             .description("Some description")
             .repeat(5)
-            .add_step(Some("First step"), || Ok(()))
-            .add_step(Some("Second step"), || Ok(()))
+            .add_step("First step", || Ok(()))
+            .add_step("Second step", || Ok(()))
             .build(),
     );
 

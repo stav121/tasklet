@@ -22,11 +22,11 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step(Some("Step 1"), || {
+            .add_step("Step 1", || {
                 info!("Hello from step 1");
                 Ok(()) // Let the scheduler know this step was a success.
             })
-            .add_step(Some("Step 2"), move || {
+            .add_step("Step 2", move || {
                 if exec_count % 2 == 0 {
                     error!("Oh no this step failed!");
                     exec_count += 1;
