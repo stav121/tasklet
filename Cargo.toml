@@ -1,14 +1,14 @@
 [package]
 name = "tasklet"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT"
 repository = "https://github.com/stav121/tasklet"
 readme = "README.md"
-description = "A task scheduling library."
-keywords = ["cron", "scheduling", "tasks", "tasklet"]
+description = "An asynchronous task scheduling library"
+keywords = ["cron", "scheduling", "tasks", "tasklet", "async"]
 
 [dependencies]
 cron = "0.12.1"

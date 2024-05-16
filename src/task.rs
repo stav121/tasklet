@@ -189,6 +189,21 @@ where
         self.receiver = Some(receiver);
     }
 
+    /// Set the task id of the current task.
+    ///
+    /// # Arguments
+    ///
+    /// * id    - the id of the task
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use chrono::Utc;
+    /// # use tasklet::task::Task;
+    ///
+    /// let mut t = Task::new("* * * * * *", None, None, Utc);
+    /// t.set_id(0);
+    /// ```
     pub fn set_id(&mut self, id: usize) {
         self.task_id = id;
     }
@@ -331,15 +346,12 @@ where
                     }
                 }
                 // Avoid underflow in case of a task without steps.
-                if self.steps.len() == 0 {
+                if self.steps.is_empty() {
                     self.status = Status::Executed
                 }
 
                 // Reduce the total executions (if set).
-                self.repeats = match self.repeats {
-                    Some(t) => Some(t - 1),
-                    None => None,
-                };
+                self.repeats = self.repeats.map(|r| r - 1);
             }
         }
     }
@@ -378,7 +390,24 @@ where
 }
 
 /// Wrap a `Task` around a receiver, each time a command is received, forward it to the task.
-pub(crate) async fn run_task<T>(mut task: Task<T>)
+///
+/// # Arguments
+///
+/// * task  - the task to run in the background
+///
+/// # Examples
+///
+/// ```
+/// # use chrono::Utc;
+/// # use tasklet::task::Task;
+/// # use tasklet::task::run_task;
+/// # tokio_test::block_on( async {
+/// let t = Task::new("* * * * * *", None, None, Utc);
+/// let h = tokio::spawn(run_task(t));
+/// # h.abort();
+/// # })
+/// ```
+pub async fn run_task<T>(mut task: Task<T>)
 where
     T: TimeZone + Send + 'static,
 {
