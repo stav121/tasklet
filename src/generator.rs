@@ -71,7 +71,7 @@ where
             Some(t) => {
                 // A task was generated and must be returned.
                 debug!("A task was found, adding it to the queue...");
-                return Some(t);
+                Some(t)
             }
             None => {
                 debug!("No task was generated.");

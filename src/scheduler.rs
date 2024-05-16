@@ -187,9 +187,7 @@ where
         receivers = Vec::new();
         for handle in &self.handles {
             let (send, recv) = oneshot::channel();
-
             let msg = TaskCmd::Reschedule { sender: send };
-
             let _ = handle.sender.send(msg).await;
             receivers.push(recv);
         }
@@ -197,19 +195,15 @@ where
         for recv in receivers {
             let res = recv.await;
             let res1 = res.unwrap();
-            match res1.status {
-                Status::Finished => {
-                    for handle in &self.handles {
-                        if handle.id == res1.id {
-                            debug!("Killing task {} due to end of execution circle.", res1.id);
-                            handle.handle.abort();
-                        }
+            if res1.status == Status::Finished {
+                for handle in &self.handles {
+                    if handle.id == res1.id {
+                        debug!("Killing task {} due to end of execution circle.", res1.id);
+                        handle.handle.abort();
                     }
-                    let index = self.handles.iter().position(|x| x.id == res1.id).unwrap();
-                    self.handles.remove(index);
                 }
-                // TODO: Handle different types of errors here
-                _ => {}
+                let index = self.handles.iter().position(|x| x.id == res1.id).unwrap();
+                self.handles.remove(index);
             }
         }
 
