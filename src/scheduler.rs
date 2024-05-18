@@ -3,7 +3,9 @@ use crate::task::{run_task, Status, Task, TaskCmd, TaskResponse};
 use chrono::prelude::*;
 use chrono::Utc;
 use futures::future::join_all;
+use futures::StreamExt;
 use log::{debug, error, info};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -160,28 +162,27 @@ where
         let mut receivers: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
 
         for handle in &self.handles {
-            let (send, recv) = oneshot::channel();
-            let msg = TaskCmd::Run { sender: send };
-            let _ = handle.sender.send(msg).await;
+            let (sender, recv) = oneshot::channel();
+            let _ = handle.sender.send(TaskCmd::Run { sender }).await;
             receivers.push(recv);
         }
 
-        let mut err_no: usize = 0;
-        let mut total_runs: usize = 0;
-        for recv in receivers {
-            let task_response = recv.await;
-            let task_response = task_response.unwrap();
-            match task_response.status {
-                Status::Executed => {
-                    total_runs += 1;
-                }
-                Status::Failed => {
-                    err_no += 1;
-                    total_runs += 1;
-                }
-                _ => {}
-            }
-        }
+        let err_no: Arc<Mutex<usize>> = Arc::new(Mutex::new(0usize));
+        let total_runs: Arc<Mutex<usize>> = Arc::new(Mutex::new(0usize));
+        futures::stream::iter(receivers)
+            .for_each(|r| async {
+                match r.await.unwrap().status {
+                    Status::Executed => {
+                        *total_runs.lock().unwrap() += 1;
+                    }
+                    Status::Failed => {
+                        *err_no.lock().unwrap() += 1;
+                        *total_runs.lock().unwrap() += 1;
+                    }
+                    _ => { /* Do nothing */ }
+                };
+            })
+            .await;
 
         // Send for reschedule
         receivers = Vec::new();
@@ -193,26 +194,25 @@ where
         }
 
         for recv in receivers {
-            let res = recv.await;
-            let res1 = res.unwrap();
-            if res1.status == Status::Finished {
+            let res = recv.await.unwrap();
+            if res.status == Status::Finished {
                 for handle in &self.handles {
-                    if handle.id == res1.id {
-                        debug!("Killing task {} due to end of execution circle.", res1.id);
+                    if handle.id == res.id {
+                        debug!("Killing task {} due to end of execution circle.", res.id);
                         handle.handle.abort();
                     }
                 }
-                let index = self.handles.iter().position(|x| x.id == res1.id).unwrap();
+                let index = self.handles.iter().position(|x| x.id == res.id).unwrap();
                 self.handles.remove(index);
             }
         }
 
         // Build the response
-        if total_runs > 0 {
-            if err_no == 0 {
-                ExecutionStatus::Success(total_runs)
+        if *total_runs.lock().unwrap() > 0 {
+            if *err_no.lock().unwrap() == 0 {
+                ExecutionStatus::Success(*total_runs.lock().unwrap())
             } else {
-                ExecutionStatus::HadError(total_runs, err_no)
+                ExecutionStatus::HadError(*total_runs.lock().unwrap(), *err_no.lock().unwrap())
             }
         } else {
             ExecutionStatus::NoExecution
@@ -227,9 +227,8 @@ where
         // Send init signal to all the tasks that are not initialized yet.
         for handle in &self.handles {
             if !handle.is_init {
-                let (send, recv) = oneshot::channel();
-                let msg = TaskCmd::Init { sender: send };
-                let _ = handle.sender.send(msg).await;
+                let (sender, recv) = oneshot::channel();
+                let _ = handle.sender.send(TaskCmd::Init { sender }).await;
                 receivers.push(recv);
                 count += 1;
             }
@@ -321,6 +320,8 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::task::TaskStepStatusErr::Error;
+    use crate::task::TaskStepStatusOk::Success;
     use crate::TaskBuilder;
     use chrono::Local;
     use std::time::Duration;
@@ -351,9 +352,9 @@ mod test {
 
         // Create a task.
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
-        task.add_step_default(|| Ok(()));
+        task.add_step_default(|| Ok(Success));
         // Return an error in the second step.
-        task.add_step_default(|| Err(()));
+        task.add_step_default(|| Err(Error(None)));
 
         // Add a task.
         scheduler.add_task(task);

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use log::info;
 use simple_logger::SimpleLogger;
+use tasklet::task::TaskStepStatusOk::Success;
 use tasklet::{TaskBuilder, TaskGenerator, TaskScheduler};
 
 /// This examples shows how to use a (not so usefully) `TaskGenerator`
@@ -26,11 +27,11 @@ async fn main() {
                 .repeat(2)
                 .add_step_default(|| {
                     info!("[Step 1] This is a generated task!");
-                    Ok(())
+                    Ok(Success)
                 })
                 .add_step_default(|| {
                     info!("[Step 2] This is generated task!");
-                    Ok(())
+                    Ok(Success)
                 })
                 .build(),
         )
