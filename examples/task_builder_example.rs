@@ -1,5 +1,6 @@
 use chrono::Utc;
 use simple_logger::SimpleLogger;
+use tasklet::task::TaskStepStatusOk::Success;
 use tasklet::{TaskBuilder, TaskScheduler};
 
 /// An example of a `TaskScheduler` instance with one`Task` instance
@@ -18,8 +19,8 @@ async fn main() {
             .every("* * * * * *")
             .description("Some description")
             .repeat(5)
-            .add_step("First step", || Ok(()))
-            .add_step("Second step", || Ok(()))
+            .add_step("First step", || Ok(Success))
+            .add_step("Second step", || Ok(Success))
             .build(),
     );
 
