@@ -1,5 +1,7 @@
-use log::{error, info};
+use log::info;
 use simple_logger::SimpleLogger;
+use tasklet::task::TaskStepStatusErr::Error;
+use tasklet::task::TaskStepStatusOk::Success;
 use tasklet::{TaskBuilder, TaskScheduler};
 
 /// A simple example of a task with two steps,
@@ -24,17 +26,16 @@ async fn main() {
             .description("A simple task")
             .add_step_default(|| {
                 info!("Hello from step 1");
-                Ok(()) // Let the scheduler know this step was a success.
+                Ok(Success) // Let the scheduler know this step was a success.
             })
             .add_step_default(move || {
                 if exec_count % 2 == 0 {
-                    error!("Oh no this step failed!");
                     exec_count += 1;
-                    return Err(()); // Indicate that this step was a fail.
+                    return Err(Error(Some("Oh no this step failed".into()))); // Indicate that this step was a fail.
                 }
                 info!("Hello from step 2");
                 exec_count += 1;
-                Ok(()) // Indicate that this step was a success.
+                Ok(Success) // Indicate that this step was a success.
             })
             .build(),
     );

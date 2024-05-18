@@ -8,8 +8,26 @@ use cron::Schedule;
 use log::{debug, error, warn};
 use tokio::sync::{mpsc, oneshot};
 
+/// Possible success status values for a step's execution.
+#[derive(Debug)]
+pub enum TaskStepStatusOk {
+    /// The step was a success, move to the next one (or exit if last).
+    Success,
+    /// The step execution had errors but can continue the execution.
+    HadErrors(Option<String>),
+}
+
+/// Possible error status values for a step's execution.
+#[derive(Debug)]
+pub enum TaskStepStatusErr {
+    /// The task step execution failed.
+    Error(Option<String>),
+    /// The step failed and the task has to be removed from the execution list.
+    ErrorDelete(Option<String>),
+}
+
 /// An executable function.
-pub type ExecutableFn = dyn FnMut() -> Result<(), ()> + 'static + Send;
+pub type ExecutableFn = dyn FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr> + 'static + Send;
 
 /// A task step.
 ///
@@ -32,12 +50,12 @@ impl TaskStep {
     /// # Examples
     ///
     /// ```
-    /// # use tasklet::task::TaskStep;
-    /// let _ = TaskStep::new("Some task", || Ok(()));
+    /// # use tasklet::task::{TaskStep, TaskStepStatusOk};
+    /// let _ = TaskStep::new("Some task", || Ok(TaskStepStatusOk::Success));
     /// ```
     pub fn new<F>(description: &str, function: F) -> Self
     where
-        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
     {
         Self {
             description: Some(description.to_string()),
@@ -55,12 +73,12 @@ impl TaskStep {
     ///
     /// ```
     /// # use tasklet::task::TaskStep;
-    ///
-    /// let _ = TaskStep::default(|| {Ok(())});
+    /// use tasklet::task::TaskStepStatusOk::Success;
+    /// let _ = TaskStep::default(|| {Ok(Success)});
     /// ```
     pub fn default<F>(function: F) -> Self
     where
-        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
     {
         Self {
             function: Box::new(function),
@@ -185,6 +203,7 @@ where
         }
     }
 
+    /// Set the receiver for the task.
     pub(crate) fn set_receiver(&mut self, receiver: mpsc::Receiver<TaskCmd>) {
         self.receiver = Some(receiver);
     }
@@ -217,7 +236,7 @@ where
     #[cfg(test)]
     pub(crate) fn add_step<F>(&mut self, description: &str, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
     {
         self.steps.push(TaskStep::new(description, function));
         self
@@ -231,7 +250,7 @@ where
     #[cfg(test)]
     pub(crate) fn add_step_default<F>(&mut self, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Result<(), ()>) + 'static + Send,
+        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
     {
         self.steps.push(TaskStep::default(function));
         self
@@ -425,12 +444,14 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::task::TaskStepStatusErr::Error;
+    use crate::task::TaskStepStatusOk::Success;
     use chrono::prelude::*;
 
     #[test]
     fn normal_task_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
-        task.add_step_default(|| Ok(()));
+        task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -450,7 +471,7 @@ mod test {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
         let mut task = Task::new("* * * * * * *", None, None, Local);
         task.set_schedule(schedule);
-        task.add_step_default(|| Ok(()));
+        task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -460,7 +481,7 @@ mod test {
     #[test]
     fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
-        task.add_step_default(|| Err(()));
+        task.add_step_default(|| Err(Error(None)));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -479,7 +500,7 @@ mod test {
     #[test]
     fn normal_task_no_fixed_repeats_test() {
         let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local);
-        task.add_step_default(|| Ok(()));
+        task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -525,7 +546,7 @@ mod test {
     #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.add_step_default(|| Err(()));
+        task.add_step_default(|| Err(Error(None)));
         task.set_id(0);
         task.init();
         task.run_task();
@@ -537,7 +558,7 @@ mod test {
     #[should_panic = "Task already executed and must be rescheduled!"]
     fn test_run_executed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.add_step("Step 1", || Ok(()));
+        task.add_step("Step 1", || Ok(Success));
         task.set_id(0);
         task.init();
         task.run_task();

@@ -1,5 +1,6 @@
 use log::info;
 use simple_logger::SimpleLogger;
+use tasklet::task::TaskStepStatusOk::Success;
 use tasklet::{TaskBuilder, TaskScheduler};
 
 /// An example of a `TaskScheduler` instance with 2 `Task` instances.
@@ -27,7 +28,7 @@ async fn main() {
                 .add_step_default(move || {
                     count = count - 1;
                     info!("I have {} more executions left!", count);
-                    Ok(())
+                    Ok(Success)
                 })
                 .build(),
         )
@@ -37,7 +38,7 @@ async fn main() {
                 .description("Just another task")
                 .add_step_default(|| {
                     info!("I will run forever!");
-                    Ok(())
+                    Ok(Success)
                 })
                 .build(),
         );
