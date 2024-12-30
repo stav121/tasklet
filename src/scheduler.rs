@@ -262,7 +262,7 @@ where
     ///
     /// This function will spawn the task, create its handle and attach it to the scheduler.
     fn run_task_gen(&mut self) -> bool {
-        return match self.task_gen {
+        match self.task_gen {
             Some(ref mut tg) => {
                 // Execute only if it's time to execute it.
                 if tg.next_exec <= Utc::now().with_timezone(&self.timezone) {
@@ -277,7 +277,7 @@ where
                 false
             }
             None => false,
-        };
+        }
     }
 
     /// Main execution loop.
