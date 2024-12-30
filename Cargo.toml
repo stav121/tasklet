@@ -1,6 +1,6 @@
 [package]
 name = "tasklet"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 rust-version = "1.75.0"
@@ -11,12 +11,12 @@ description = "An asynchronous task scheduling library"
 keywords = ["cron", "scheduling", "tasks", "tasklet", "async"]
 
 [dependencies]
-cron = "0.12.1"
-chrono = "0.4.38"
-time = "0.3.36"
-log = "0.4.21"
-tokio = { version = "1.37.0", features = ["full"] }
-futures = "0.3.30"
+cron = "0.14.0"
+chrono = "0.4.39"
+time = "0.3.37"
+log = "0.4.22"
+tokio = { version = "1.42.0", features = ["full"] }
+futures = "0.3.31"
 
 [dev-dependencies]
 simple_logger = "5.0.0"
