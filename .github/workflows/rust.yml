@@ -1,4 +1,4 @@
-name: Rust
+name: Rust Build and Test
 
 on:
   push:
@@ -18,6 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
 
+      - name: Update Rust
+        run: rustup update stable
+
       - name: Build
         run: cargo build --verbose
 
@@ -33,6 +36,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v2
+
+      - name: Update rust
+        run: rustup update stable
 
       - name: Setup
         run: |
