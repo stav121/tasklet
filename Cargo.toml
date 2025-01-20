@@ -11,7 +11,7 @@ description = "An asynchronous task scheduling library"
 keywords = ["cron", "scheduling", "tasks", "tasklet", "async"]
 
 [dependencies]
-cron = "0.14.0"
+cron = "0.15.0"
 chrono = "0.4.39"
 time = "0.3.37"
 log = "0.4.22"
