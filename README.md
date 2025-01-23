@@ -21,11 +21,11 @@ in order to run tasks asynchronously.
 
 | library | version |
 |---------|---------|
-| cron    | 0.14.0  |
+| cron    | 0.15.0  |
 | chrono  | 0.4.39  |
 | time    | 0.3.37  |
-| log     | 0.4.22  |
-| tokio   | 1.42.0  |
+| log     | 0.4.25  |
+| tokio   | 1.43.0  |
 | futures | 0.3.31  |
 
 ## How to use this library
