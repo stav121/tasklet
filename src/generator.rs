@@ -61,12 +61,8 @@ where
 
     /// Run the discovery function and reschedule the generation function.
     pub(crate) fn run(&mut self) -> Option<Task<T>> {
-        debug!("Executing discovery function.");
-        self.next_exec = self
-            .schedule
-            .upcoming(self.timezone.clone())
-            .next()
-            .unwrap();
+        debug!("Executing discovery function");
+        self.next_exec = self.schedule.upcoming(self.timezone.clone()).next()?;
         match (self.discovery_function)() {
             Some(t) => {
                 // A task was generated and must be returned.
@@ -74,7 +70,7 @@ where
                 Some(t)
             }
             None => {
-                debug!("No task was generated.");
+                debug!("No task was generated");
                 None
             }
         }
