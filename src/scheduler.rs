@@ -188,17 +188,27 @@ where
         receivers = Vec::new();
         for handle in &self.handles {
             let (send, recv) = oneshot::channel();
-            let msg = TaskCmd::Reschedule { sender: send };
-            let _ = handle.sender.send(msg).await;
+            let _ = handle
+                .sender
+                .send(TaskCmd::Reschedule { sender: send })
+                .await;
             receivers.push(recv);
         }
 
         for recv in receivers {
             let res = recv.await.unwrap();
-            if res.status == Status::Finished {
+            if res.status == Status::Finished || res.status == Status::ForceRemoved {
                 for handle in &self.handles {
                     if handle.id == res.id {
-                        debug!("Killing task {} due to end of execution circle.", res.id);
+                        debug!(
+                            "Killing task {} due {}",
+                            res.id,
+                            if res.status == Status::Finished {
+                                "to end of execution circle."
+                            } else {
+                                "force removal."
+                            }
+                        );
                         handle.handle.abort();
                     }
                 }
@@ -243,16 +253,16 @@ where
                             .iter_mut()
                             .filter(|h| h.id == r.id)
                             .for_each(|h| {
-                                info!("Task with id {} initialized.", h.id);
+                                info!("Task with id {} initialized", h.id);
                                 h.is_init = true;
                             });
                     }
                     _ => {
-                        error!("Task with id {} failed to initialize.", r.id);
+                        error!("Task with id {} failed to initialize", r.id);
                     }
                 },
                 Err(_) => {
-                    error!("RecvError returned by at least one uninitialized task.")
+                    error!("RecvError returned by at least one uninitialized task")
                 }
             });
         }
@@ -302,11 +312,11 @@ where
             }
             match self.execute_tasks().await {
                 ExecutionStatus::Success(c) => {
-                    info!("Execution round run successfully for {} total tasks", c);
+                    info!("Execution round run successfully for {} total task(s)", c);
                 }
                 ExecutionStatus::HadError(c, e) => {
                     error!(
-                        "Execution round executed {} total tasks and had {} total errors.",
+                        "Execution round executed {} total task(s) and had {} total error(s)",
                         c, e
                     );
                 }
@@ -320,7 +330,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::task::TaskStepStatusErr::Error;
+    use crate::task::TaskStepStatusErr::{Error, ErrorDelete};
     use crate::task::TaskStepStatusOk::Success;
     use crate::TaskBuilder;
     use chrono::Local;
@@ -346,6 +356,29 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scheduler_normal_force_deletion() {
+        // Create a new scheduler instance.
+        let mut scheduler = TaskScheduler::new(500, Local);
+        // Create a task.
+        let mut task = Task::new("* * * * * * *", None, Some(1), Local);
+        task.add_step_default(|| Err(ErrorDelete));
+        // Add a couple of tasks.
+        scheduler
+            .add_task(task)
+            .add_task(Task::new("* * * * * * *", None, None, Local));
+        assert_eq!(scheduler.handles.len(), 2);
+        // Initialize the tasks.
+        scheduler.init_tasks().await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        scheduler.execute_tasks().await;
+        // The first task should be force-removed at this point
+        assert_eq!(scheduler.handles.len(), 1);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        scheduler.execute_tasks().await;
+        assert_eq!(scheduler.handles.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_scheduler_normal_flow_error_case() {
         // Create a new scheduler instance.
         let mut scheduler = TaskScheduler::new(500, Local);
@@ -354,7 +387,7 @@ mod test {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
         task.add_step_default(|| Ok(Success));
         // Return an error in the second step.
-        task.add_step_default(|| Err(Error(None)));
+        task.add_step_default(|| Err(Error));
 
         // Add a task.
         scheduler.add_task(task);

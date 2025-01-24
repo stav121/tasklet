@@ -31,7 +31,7 @@ async fn main() {
             .add_step("Step 2", move || {
                 if exec_count % 2 == 0 {
                     exec_count += 1;
-                    Err(Error(Some("Oh no this task failed".into()))) // Indicate that this step was a fail.
+                    Err(Error) // Indicate that this step was a fail.
                 } else {
                     info!("Hello from step 2");
                     exec_count += 1;

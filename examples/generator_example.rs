@@ -5,7 +5,7 @@ use tasklet::task::TaskStepStatusOk::Success;
 use tasklet::{TaskBuilder, TaskGenerator, TaskScheduler};
 
 /// This examples shows how to use a (not so usefully) `TaskGenerator`
-/// to generate new tasks for the a `TaskScheduler`.
+/// to generate new tasks for the `TaskScheduler`.
 #[tokio::main]
 async fn main() {
     // Initialize the logger.
