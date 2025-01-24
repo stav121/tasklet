@@ -1,7 +1,6 @@
 extern crate chrono;
 extern crate cron;
 
-use crate::task::Status::Init;
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
@@ -14,16 +13,16 @@ pub enum TaskStepStatusOk {
     /// The step was a success, move to the next one (or exit if last).
     Success,
     /// The step execution had errors but can continue the execution.
-    HadErrors(Option<String>),
+    HadErrors,
 }
 
 /// Possible error status values for a step's execution.
 #[derive(Debug)]
 pub enum TaskStepStatusErr {
     /// The task step execution failed.
-    Error(Option<String>),
+    Error,
     /// The step failed and the task has to be removed from the execution list.
-    ErrorDelete(Option<String>),
+    ErrorDelete,
 }
 
 /// An executable function.
@@ -99,8 +98,10 @@ pub enum Status {
     Failed,
     /// The task has executed successfully.
     Executed,
-    /// The task has finished and can be removed from the queue
+    /// The task has finished and can be removed from the queue.
     Finished,
+    /// The task is forcibly removed from the execution list due to fatal error.
+    ForceRemoved,
 }
 
 /// A message response from a task
@@ -282,7 +283,7 @@ where
     ///
     /// * id - The task's id.
     pub(crate) fn init(&mut self) {
-        debug!("Task with id {} is initializing.", self.task_id);
+        debug!("Task with id {} is initializing", self.task_id);
         self.next_exec = Some(
             self.schedule
                 .upcoming(self.timezone.clone())
@@ -290,7 +291,7 @@ where
                 .unwrap(),
         );
         self.status = Status::Scheduled;
-        debug!("Task with id {} finished initializing.", self.task_id);
+        debug!("Task with id {} finished initializing", self.task_id);
     }
 
     /// Create a `TaskResponse` from the current state of the task.
@@ -321,7 +322,7 @@ where
                 let _ = sender.send(self.get_task_response());
             }
             TaskCmd::Init { sender } => {
-                if self.status == Init {
+                if self.status == Status::Init {
                     self.init();
                 }
                 let _ = sender.send(self.get_task_response());
@@ -336,6 +337,7 @@ where
             Status::Failed => panic!("Task must be rescheduled!"),
             Status::Executed => panic!("Task already executed and must be rescheduled!"),
             Status::Finished => panic!("Task has finished and must be removed!"),
+            Status::ForceRemoved => panic!("Task has been forced removed!"),
             Status::Scheduled => {
                 debug!(
                     "[Task {}] [{}] is been executed...",
@@ -345,21 +347,32 @@ where
                 for (index, step) in self.steps.iter_mut().enumerate() {
                     if !had_error {
                         match (step.function)() {
-                            Ok(_) => {
-                                debug!(
-                                    "[Task {}-{}] [{:?}] Executed successfully.",
-                                    self.task_id, index, step.description,
-                                );
+                            Ok(status) => {
+                                match status {
+                                    TaskStepStatusOk::Success => debug!("[Task step {}-{}] [{:?}] Executed successfully",self.task_id, index, step.description),
+                                    TaskStepStatusOk::HadErrors => debug!("[Task step {}-{}] [{:?}] Executed successfully but had some non fatal errors",self.task_id, index, step.description)
+                                }
                                 self.status = Status::Executed
                             }
-                            Err(_) => {
-                                error!(
-                                    "[Task {}-{}]  [{:?}] Execution failed.",
-                                    self.task_id, index, step.description,
-                                );
+                            Err(status) => {
                                 // Indicate that there was an error.
                                 had_error = true;
-                                self.status = Status::Failed
+                                match status {
+                                    TaskStepStatusErr::Error => {
+                                        error!(
+                                            "[Task step {}-{}]  [{:?}] Execution failed",
+                                            self.task_id, index, step.description
+                                        );
+                                        self.status = Status::Failed
+                                    }
+                                    TaskStepStatusErr::ErrorDelete => {
+                                        error!(
+                                            "[Task step {}-{}]  [{:?}] Execution failed and the task is marked for deletion",
+                                            self.task_id, index, step.description
+                                        );
+                                        self.status = Status::ForceRemoved
+                                    }
+                                }
                             }
                         };
                     }
@@ -389,11 +402,11 @@ where
                 self.status = match self.repeats {
                     Some(t) => {
                         if t > 0 {
-                            debug!("[Task {}] Has been rescheduled.", self.task_id);
+                            debug!("[Task {}] Has been rescheduled", self.task_id);
                             Status::Scheduled
                         } else {
                             warn!(
-                                "[Task  {}] Has finished its execution cycle and will be removed.",
+                                "[Task  {}] Has finished its execution cycle and will be removed",
                                 self.task_id
                             );
                             Status::Finished
@@ -402,8 +415,11 @@ where
                     None => Status::Scheduled,
                 }
             }
-            Status::Finished => panic!("[Task {}] has finished and must be removed!", self.task_id),
-            Status::Scheduled => { /* Do nothing */ }
+            Status::Finished | Status::ForceRemoved => warn!(
+                "[Task {}] The task will be removed from the queue",
+                self.task_id
+            ),
+            Status::Scheduled => { /* Do nothing, keep silent */ }
         }
     }
 }
@@ -444,7 +460,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::task::TaskStepStatusErr::Error;
+    use crate::task::TaskStepStatusErr::{Error, ErrorDelete};
     use crate::task::TaskStepStatusOk::Success;
     use chrono::prelude::*;
 
@@ -481,7 +497,7 @@ mod test {
     #[test]
     fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
-        task.add_step_default(|| Err(Error(None)));
+        task.add_step_default(|| Err(Error));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -523,16 +539,14 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "[Task 0] has finished and must be removed!")]
-    fn test_reschedule_finished_panic() {
+    fn test_reschedule_finished_should_mark_as_finished() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local);
         // Execute the task.
         task.set_id(0);
         task.init();
         task.run_task();
         task.reschedule();
-        // Try to reschedule after it's finished. It should fail.
-        task.reschedule();
+        assert_eq!(task.status, Status::Finished);
     }
 
     #[test]
@@ -546,7 +560,7 @@ mod test {
     #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.add_step_default(|| Err(Error(None)));
+        task.add_step_default(|| Err(Error));
         task.set_id(0);
         task.init();
         task.run_task();
@@ -576,5 +590,15 @@ mod test {
         task.reschedule();
         // At this point the task is Finished. It should not be allowed to run again.
         task.run_task();
+    }
+
+    #[test]
+    fn test_run_failed_delete() {
+        let mut task = Task::new("* * * * * * *", None, None, Local);
+        task.add_step_default(|| Err(ErrorDelete));
+        task.set_id(0);
+        task.init();
+        task.run_task();
+        assert_eq!(task.status, Status::ForceRemoved);
     }
 }

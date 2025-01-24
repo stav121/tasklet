@@ -109,7 +109,7 @@ where
     /// ```rust
     /// # use tasklet::task::TaskStepStatusErr::Error;
     /// # use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || Err(Error(None)));
+    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || Err(Error));
     /// ```
     pub fn add_step<F>(mut self, description: &str, function: F) -> TaskBuilder<T>
     where
