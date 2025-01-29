@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Task execution possible statuses.
+#[derive(Debug, PartialEq)]
 pub(crate) enum ExecutionStatus {
     Success(usize),
     NoExecution,
@@ -348,10 +349,12 @@ mod test {
         // Initialize the tasks.
         scheduler.init_tasks().await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        scheduler.execute_tasks().await;
+        let status: ExecutionStatus = scheduler.execute_tasks().await;
+        assert_eq!(status, ExecutionStatus::Success(2));
         assert_eq!(scheduler.handles.len(), 2);
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        scheduler.execute_tasks().await;
+        let status: ExecutionStatus = scheduler.execute_tasks().await;
+        assert_eq!(status, ExecutionStatus::Success(2));
         assert_eq!(scheduler.handles.len(), 1);
     }
 
@@ -376,6 +379,19 @@ mod test {
         tokio::time::sleep(Duration::from_millis(1000)).await;
         scheduler.execute_tasks().await;
         assert_eq!(scheduler.handles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_normal_flow_no_execution() {
+        // Create a new scheduler instance.
+        let mut scheduler = TaskScheduler::new(500, Local);
+        // Init the scheduler.
+        scheduler.init_tasks().await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Run the scheduler
+        let status: ExecutionStatus = scheduler.execute_tasks().await;
+        // No tasks should be executed.
+        assert_eq!(status, ExecutionStatus::NoExecution);
     }
 
     #[tokio::test]
