@@ -5,6 +5,7 @@ use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use log::{debug, error, warn};
+use std::fmt;
 use tokio::sync::{mpsc, oneshot};
 
 /// Possible success status values for a step's execution.
@@ -36,6 +37,15 @@ pub struct TaskStep {
     pub(crate) function: Box<ExecutableFn>,
     /// An (optional) short description.
     pub(crate) description: Option<String>,
+}
+
+impl fmt::Display for TaskStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.description {
+            Some(desc) if !desc.is_empty() => write!(f, "{}", desc),
+            _ => write!(f, "-"),
+        }
+    }
 }
 
 impl TaskStep {
@@ -349,8 +359,8 @@ where
                         match (step.function)() {
                             Ok(status) => {
                                 match status {
-                                    TaskStepStatusOk::Success => debug!("[Task step {}-{}] [{:?}] Executed successfully",self.task_id, index, step.description),
-                                    TaskStepStatusOk::HadErrors => debug!("[Task step {}-{}] [{:?}] Executed successfully but had some non fatal errors",self.task_id, index, step.description)
+                                    TaskStepStatusOk::Success => debug!("[Task step {}-{}] [{}] Executed successfully",self.task_id, index, step),
+                                    TaskStepStatusOk::HadErrors => debug!("[Task step {}-{}] [{}] Executed successfully but had some non fatal errors",self.task_id, index, step)
                                 }
                                 self.status = Status::Executed
                             }
@@ -360,16 +370,13 @@ where
                                 match status {
                                     TaskStepStatusErr::Error => {
                                         error!(
-                                            "[Task step {}-{}]  [{:?}] Execution failed",
-                                            self.task_id, index, step.description
+                                            "[Task step {}-{}] [{}] Execution failed",
+                                            self.task_id, index, step
                                         );
                                         self.status = Status::Failed
                                     }
                                     TaskStepStatusErr::ErrorDelete => {
-                                        error!(
-                                            "[Task step {}-{}]  [{:?}] Execution failed and the task is marked for deletion",
-                                            self.task_id, index, step.description
-                                        );
+                                        error!("[Task step {}-{}] [{}] Execution failed and the task is marked for deletion",self.task_id, index, step);
                                         self.status = Status::ForceRemoved
                                     }
                                 }
