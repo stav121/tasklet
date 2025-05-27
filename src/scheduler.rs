@@ -1,3 +1,4 @@
+use crate::errors::{TaskError, TaskResult};
 use crate::generator::TaskGenerator;
 use crate::task::{run_task, Status, Task, TaskCmd, TaskResponse};
 use chrono::prelude::*;
@@ -132,27 +133,35 @@ where
     /// // Create a new `TaskScheduler` and attach a task to it.
     /// let mut scheduler = TaskScheduler::default(chrono::Local);
     /// // Add a task that executes every second forever.
-    /// scheduler.add_task(Task::new("* * * * * * *", None, None, chrono::Local));
+    /// scheduler.add_task(Task::new("* * * * * * *", None, None, chrono::Local)).unwrap();
     /// # });
     /// ```
-    pub fn add_task(&mut self, mut task: Task<T>) -> &mut TaskScheduler<T> {
-        let (sender, receiver) = mpsc::channel(32);
+    pub fn add_task(
+        &mut self,
+        task: TaskResult<Task<T>>,
+    ) -> Result<&mut TaskScheduler<T>, TaskError> {
+        match task {
+            Ok(mut task) => {
+                let (sender, receiver) = mpsc::channel(32);
 
-        task.set_receiver(receiver);
-        task.set_id(self.next_id);
-        let handle = tokio::spawn(run_task(task));
+                task.set_receiver(receiver);
+                task.set_id(self.next_id);
+                let handle = tokio::spawn(run_task(task));
 
-        // Push the handle
-        self.handles.push(TaskHandle {
-            id: self.next_id,
-            handle,
-            sender,
-            is_init: false,
-        });
+                // Push the handle
+                self.handles.push(TaskHandle {
+                    id: self.next_id,
+                    handle,
+                    sender,
+                    is_init: false,
+                });
 
-        // Increase the id of the next task.
-        self.next_id += 1;
-        self
+                // Increase the id of the next task.
+                self.next_id += 1;
+                Ok(self)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Execute all the tasks in the queue.
@@ -279,7 +288,7 @@ where
                 if tg.next_exec <= Utc::now().with_timezone(&self.timezone) {
                     return match tg.run() {
                         Some(t) => {
-                            self.add_task(t);
+                            let _ = self.add_task(t);
                             true
                         }
                         None => false,
@@ -344,7 +353,9 @@ mod test {
         // Add a couple of tasks.
         scheduler
             .add_task(Task::new("* * * * * * *", None, Some(2), Local))
-            .add_task(Task::new("* * * * * * *", None, None, Local));
+            .unwrap()
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
         assert_eq!(scheduler.handles.len(), 2);
         // Initialize the tasks.
         scheduler.init_tasks().await;
@@ -363,12 +374,14 @@ mod test {
         // Create a new scheduler instance.
         let mut scheduler = TaskScheduler::new(500, Local);
         // Create a task.
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local);
+        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         task.add_step_default(|| Err(ErrorDelete));
         // Add a couple of tasks.
         scheduler
-            .add_task(task)
-            .add_task(Task::new("* * * * * * *", None, None, Local));
+            .add_task(Ok(task))
+            .unwrap()
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
         assert_eq!(scheduler.handles.len(), 2);
         // Initialize the tasks.
         scheduler.init_tasks().await;
@@ -400,13 +413,13 @@ mod test {
         let mut scheduler = TaskScheduler::new(500, Local);
 
         // Create a task.
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local);
+        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         task.add_step_default(|| Ok(Success));
         // Return an error in the second step.
         task.add_step_default(|| Err(Error));
 
         // Add a task.
-        scheduler.add_task(task);
+        scheduler.add_task(Ok(task)).unwrap();
         assert_eq!(scheduler.handles.len(), 1);
         // Initialize the task.
         scheduler.init_tasks().await;

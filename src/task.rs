@@ -1,15 +1,16 @@
 extern crate chrono;
 extern crate cron;
 
+use crate::errors::{TaskError, TaskResult};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use log::{debug, error, warn};
-use std::fmt;
+use std::fmt::{self, Debug};
 use tokio::sync::{mpsc, oneshot};
 
 /// Possible success status values for a step's execution.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TaskStepStatusOk {
     /// The step was a success, move to the next one (or exit if last).
     Success,
@@ -18,7 +19,7 @@ pub enum TaskStepStatusOk {
 }
 
 /// Possible error status values for a step's execution.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TaskStepStatusErr {
     /// The task step execution failed.
     Error,
@@ -167,6 +168,21 @@ where
 
 unsafe impl<T> Send for Task<T> where T: TimeZone + Send + 'static {}
 
+impl<T> Debug for Task<T>
+where
+    T: TimeZone + Send + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Task")
+            .field("task_id", &self.task_id)
+            .field("description", &self.description)
+            .field("status", &self.status)
+            .field("repeats", &self.repeats)
+            .field("next_exec", &self.next_exec)
+            .finish()
+    }
+}
+
 impl<T> Task<T>
 where
     T: TimeZone + Send + 'static,
@@ -197,10 +213,15 @@ where
         description: Option<&str>,
         repeats: Option<usize>,
         timezone: T,
-    ) -> Task<T> {
-        Task {
+    ) -> TaskResult<Task<T>> {
+        // Parse the schedule with proper error handling
+        let schedule = expression.parse().map_err(|e| {
+            TaskError::InvalidCronExpression(format!("Invalid cron expression: {}", e))
+        })?;
+
+        Ok(Task {
             steps: Vec::new(),
-            schedule: expression.parse().unwrap(),
+            schedule,
             description: match description {
                 Some(s) => s.to_string(),
                 None => "-".to_string(),
@@ -211,7 +232,7 @@ where
             status: Status::default(),
             next_exec: None,
             receiver: None,
-        }
+        })
     }
 
     /// Set the receiver for the task.
@@ -231,7 +252,7 @@ where
     /// # use chrono::Utc;
     /// # use tasklet::task::Task;
     ///
-    /// let mut t = Task::new("* * * * * *", None, None, Utc);
+    /// let mut t = Task::new("* * * * * *", None, None, Utc).unwrap();
     /// t.set_id(0);
     /// ```
     pub fn set_id(&mut self, id: usize) {
@@ -323,12 +344,12 @@ where
                 if self.next_exec.as_ref().unwrap()
                     <= &Utc::now().with_timezone(&self.timezone.clone())
                 {
-                    self.run_task();
+                    let _ = self.run_task(); // Ignore the result as we already update the status
                 }
                 let _ = sender.send(self.get_task_response());
             }
             TaskCmd::Reschedule { sender } => {
-                self.reschedule();
+                let _ = self.reschedule(); // Ignore the result as we already update the status
                 let _ = sender.send(self.get_task_response());
             }
             TaskCmd::Init { sender } => {
@@ -341,13 +362,13 @@ where
     }
 
     /// Run the task and handle the output.
-    pub(crate) fn run_task(&mut self) {
+    pub(crate) fn run_task(&mut self) -> TaskResult<()> {
         match &self.status {
-            Status::Init => panic!("Task not initialized yet!"),
-            Status::Failed => panic!("Task must be rescheduled!"),
-            Status::Executed => panic!("Task already executed and must be rescheduled!"),
-            Status::Finished => panic!("Task has finished and must be removed!"),
-            Status::ForceRemoved => panic!("Task has been forced removed!"),
+            Status::Init => Err(TaskError::NotInitialized),
+            Status::Failed => Err(TaskError::Failed),
+            Status::Executed => Err(TaskError::AlreadyExecuted),
+            Status::Finished => Err(TaskError::Finished),
+            Status::ForceRemoved => Err(TaskError::ForceRemoved),
             Status::Scheduled => {
                 debug!(
                     "[Task {}] [{}] is been executed...",
@@ -391,14 +412,16 @@ where
 
                 // Reduce the total executions (if set).
                 self.repeats = self.repeats.map(|r| r - 1);
+
+                Ok(())
             }
         }
     }
 
     /// Reschedule the current task instance (if needed).
-    pub(crate) fn reschedule(&mut self) {
+    pub(crate) fn reschedule(&mut self) -> TaskResult<()> {
         match &self.status {
-            Status::Init => panic!("Task not initialized yet!"),
+            Status::Init => Err(TaskError::NotInitialized),
             Status::Failed | Status::Executed => {
                 self.next_exec = Some(
                     self.schedule
@@ -420,13 +443,17 @@ where
                         }
                     }
                     None => Status::Scheduled,
-                }
+                };
+                Ok(())
             }
-            Status::Finished | Status::ForceRemoved => warn!(
-                "[Task {}] The task will be removed from the queue",
-                self.task_id
-            ),
-            Status::Scheduled => { /* Do nothing, keep silent */ }
+            Status::Finished | Status::ForceRemoved => {
+                warn!(
+                    "[Task {}] The task will be removed from the queue",
+                    self.task_id
+                );
+                Ok(())
+            }
+            Status::Scheduled => Ok(()), /* Do nothing, keep silent */
         }
     }
 }
@@ -444,7 +471,7 @@ where
 /// # use tasklet::task::Task;
 /// # use tasklet::task::run_task;
 /// # tokio_test::block_on( async {
-/// let t = Task::new("* * * * * *", None, None, Utc);
+/// let t = Task::new("* * * * * *", None, None, Utc).unwrap();
 /// let h = tokio::spawn(run_task(t));
 /// # h.abort();
 /// # })
@@ -473,26 +500,26 @@ mod test {
 
     #[test]
     fn normal_task_flow_test() {
-        let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
+        let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
         task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        task.run_task();
+        assert!(task.run_task().is_ok());
         assert_eq!(task.status, Status::Executed);
-        task.reschedule();
+        assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        task.run_task();
+        assert!(task.run_task().is_ok());
         assert_eq!(task.status, Status::Executed);
-        task.reschedule();
+        assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
 
     #[test]
     fn test_task_set_schedule() {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
-        let mut task = Task::new("* * * * * * *", None, None, Local);
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.set_schedule(schedule);
         task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
@@ -503,26 +530,26 @@ mod test {
 
     #[test]
     fn normal_task_error_flow_test() {
-        let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local);
+        let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
         task.add_step_default(|| Err(Error));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        task.run_task();
+        assert!(task.run_task().is_ok());
         assert_eq!(task.status, Status::Failed);
-        task.reschedule();
+        assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        task.run_task();
+        assert!(task.run_task().is_ok());
         assert_eq!(task.status, Status::Failed);
-        task.reschedule();
+        assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
 
     /// Test the normal execution of a simple task, without fixed repeats.
     #[test]
     fn normal_task_no_fixed_repeats_test() {
-        let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local);
+        let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local).unwrap();
         task.add_step_default(|| Ok(Success));
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
@@ -530,82 +557,104 @@ mod test {
         assert_eq!(task.status, Status::Scheduled);
         // Run it for a few times.
         for _i in 1..10 {
-            task.run_task();
+            assert!(task.run_task().is_ok());
             assert_eq!(task.status, Status::Executed);
-            task.reschedule();
+            assert!(task.reschedule().is_ok());
             assert_eq!(task.status, Status::Scheduled);
         }
     }
 
     #[test]
-    #[should_panic(expected = "Task not initialized yet!")]
-    fn test_reschedule_init_panic() {
-        let mut task = Task::new("* * * * * * *", None, None, Local);
+    fn test_reschedule_not_initialized() {
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         // This task is not initialized, so it should fail.
-        task.reschedule();
+        assert!(task.reschedule().is_err());
+        assert!(matches!(
+            task.reschedule().unwrap_err(),
+            TaskError::NotInitialized
+        ));
     }
 
     #[test]
     fn test_reschedule_finished_should_mark_as_finished() {
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local);
+        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         // Execute the task.
         task.set_id(0);
         task.init();
-        task.run_task();
-        task.reschedule();
+        assert!(task.run_task().is_ok());
+        assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
 
     #[test]
-    #[should_panic = "Task not initialized yet!"]
     fn test_run_uninitialized_task() {
-        let mut task = Task::new("* * * * * * *", None, None, Local);
-        task.run_task();
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
+        assert!(task.run_task().is_err());
+        assert!(matches!(
+            task.run_task().unwrap_err(),
+            TaskError::NotInitialized
+        ));
     }
 
     #[test]
-    #[should_panic = "Task must be rescheduled!"]
     fn test_run_failed_task() {
-        let mut task = Task::new("* * * * * * *", None, None, Local);
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.add_step_default(|| Err(Error));
         task.set_id(0);
         task.init();
-        task.run_task();
+        assert!(task.run_task().is_ok());
+        assert_eq!(task.status, Status::Failed);
         // Attempt to rerun it, it should fail.
-        task.run_task();
+        assert!(task.run_task().is_err());
+        assert!(matches!(task.run_task().unwrap_err(), TaskError::Failed));
     }
 
     #[test]
-    #[should_panic = "Task already executed and must be rescheduled!"]
     fn test_run_executed_task() {
-        let mut task = Task::new("* * * * * * *", None, None, Local);
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.add_step("Step 1", || Ok(Success));
         task.set_id(0);
         task.init();
-        task.run_task();
+        assert!(task.run_task().is_ok());
+        assert_eq!(task.status, Status::Executed);
         // Attempt to run it again, it should fail.
-        task.run_task();
+        assert!(task.run_task().is_err());
+        assert!(matches!(
+            task.run_task().unwrap_err(),
+            TaskError::AlreadyExecuted
+        ));
     }
 
     #[test]
-    #[should_panic = "Task has finished and must be removed!"]
     fn test_run_finished_task() {
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local);
+        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         task.set_id(0);
         task.init();
-        task.run_task();
-        task.reschedule();
+        assert!(task.run_task().is_ok());
+        assert!(task.reschedule().is_ok());
+        assert_eq!(task.status, Status::Finished);
         // At this point the task is Finished. It should not be allowed to run again.
-        task.run_task();
+        assert!(task.run_task().is_err());
+        assert!(matches!(task.run_task().unwrap_err(), TaskError::Finished));
     }
 
     #[test]
     fn test_run_failed_delete() {
-        let mut task = Task::new("* * * * * * *", None, None, Local);
+        let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.add_step_default(|| Err(ErrorDelete));
         task.set_id(0);
         task.init();
-        task.run_task();
+        assert!(task.run_task().is_ok());
         assert_eq!(task.status, Status::ForceRemoved);
+    }
+
+    #[test]
+    fn test_invalid_cron_expression() {
+        let task = Task::new("invalid expression", None, None, Local);
+        assert!(task.is_err());
+        assert!(matches!(
+            task.unwrap_err(),
+            TaskError::InvalidCronExpression(_)
+        ));
     }
 }
