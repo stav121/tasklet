@@ -14,7 +14,7 @@ async fn main() {
     let mut scheduler = TaskScheduler::new(500, Utc);
 
     // Append a new task with two steps.
-    scheduler.add_task(
+    let _ = scheduler.add_task(
         TaskBuilder::new(Utc)
             .every("* * * * * *")
             .description("Some description")

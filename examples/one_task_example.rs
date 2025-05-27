@@ -20,7 +20,7 @@ async fn main() {
     // Create a task with 2 steps and add it to the scheduler.
     // The second step fails every second execution.
     // Append the task to the scheduler.
-    scheduler.add_task(
+    let _ = scheduler.add_task(
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")

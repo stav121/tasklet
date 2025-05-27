@@ -1,5 +1,6 @@
 extern crate chrono;
 extern crate cron;
+use crate::errors::TaskResult;
 use crate::task::Task;
 use chrono::prelude::*;
 use chrono::DateTime;
@@ -15,7 +16,7 @@ where
     T: TimeZone + Send + 'static,
 {
     /// The discovery function, used to retrieve new tasks.
-    discovery_function: Box<dyn (FnMut() -> Option<Task<T>>)>,
+    discovery_function: Box<dyn (FnMut() -> Option<TaskResult<Task<T>>>)>,
     /// The execution schedule.
     schedule: Schedule,
     /// The task generator's timezone.
@@ -47,7 +48,7 @@ where
     /// ```
     pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskGenerator<T>
     where
-        F: (FnMut() -> Option<Task<T>>) + 'static,
+        F: (FnMut() -> Option<TaskResult<Task<T>>>) + 'static,
     {
         let schedule: Schedule = expression.parse().unwrap();
 
@@ -60,7 +61,7 @@ where
     }
 
     /// Run the discovery function and reschedule the generation function.
-    pub(crate) fn run(&mut self) -> Option<Task<T>> {
+    pub(crate) fn run(&mut self) -> Option<TaskResult<Task<T>>> {
         debug!("Executing discovery function");
         self.next_exec = self.schedule.upcoming(self.timezone.clone()).next()?;
         match (self.discovery_function)() {
@@ -92,7 +93,7 @@ mod test {
         let mut task_gen = TaskGenerator::new("* * * * * * *", Local, || {
             Some(Task::new("* * * * * * *", None, Some(1), Local))
         });
-        assert!(!task_gen.run().is_none());
+        assert!(task_gen.run().is_some());
     }
 
     /// Test the normal flow of a task generation instance.
