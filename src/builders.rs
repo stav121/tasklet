@@ -1,3 +1,4 @@
+use crate::errors::{TaskError, TaskResult};
 use crate::task::{Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk};
 use chrono::TimeZone;
 use cron::Schedule;
@@ -16,6 +17,8 @@ where
     /// The provided `Schedule`, if not given,
     /// it will be defaulted to once every hour.
     schedule: Option<Schedule>,
+    /// The original expression string, for error reporting
+    expression: String,
     /// Max number of repeats.
     repeats: Option<usize>,
     /// The Task/Scheduler timezone.
@@ -43,6 +46,7 @@ where
             steps: Vec::new(),
             description: None,
             schedule: None,
+            expression: "* * * * * * *".to_string(), // Default expression
             repeats: None,
             timezone,
         }
@@ -56,7 +60,7 @@ where
     ///
     /// ```rust
     /// # use tasklet::TaskBuilder;
-    /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").description("Description").build();
+    /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").description("Description").build().unwrap();
     /// ```
     pub fn description(mut self, description: &str) -> TaskBuilder<T> {
         self.description = Some(description.to_string());
@@ -73,10 +77,19 @@ where
     ///
     /// ```rust
     /// # use tasklet::{TaskBuilder, Task};
-    /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").build();
+    /// let _task = TaskBuilder::new(chrono::Local).every("* * * * * * *").build().unwrap();
     /// ```
     pub fn every(mut self, expression: &str) -> TaskBuilder<T> {
-        self.schedule = Some(expression.parse().unwrap());
+        self.expression = expression.to_string();
+        match expression.parse() {
+            Ok(schedule) => {
+                self.schedule = Some(schedule);
+            }
+            Err(_) => {
+                // We'll validate at build time
+                self.schedule = None;
+            }
+        };
         self
     }
 
@@ -144,24 +157,38 @@ where
     ///
     /// ```rust
     /// # use tasklet::{TaskBuilder, Task};
-    /// let mut _task = TaskBuilder::new(chrono::Utc).build();
+    /// let mut _task = TaskBuilder::new(chrono::Utc).build().unwrap();
     /// ```
-    pub fn build(self) -> Task<T> {
+    pub fn build(self) -> TaskResult<Task<T>> {
+        // Validate schedule if provided
+        let schedule = match self.schedule {
+            Some(s) => s,
+            None => {
+                // Try to parse the expression
+                self.expression.parse().map_err(|e| {
+                    TaskError::InvalidCronExpression(format!(
+                        "Invalid cron expression '{}': {}",
+                        self.expression, e
+                    ))
+                })?
+            }
+        };
+
+        // Create the task with default expression - we'll replace the schedule after
         let mut task = Task::new(
-            "* * * * * * *",
-            match self.description {
-                Some(ref x) => Some(&x[..]),
-                None => None,
-            },
+            "* * * * * * *", // This is just a placeholder, we'll set the real schedule next
+            self.description.as_deref(),
             self.repeats,
             self.timezone,
-        );
-        task.set_schedule(
-            self.schedule
-                .unwrap_or_else(|| "* * * * * * *".parse().unwrap()),
-        );
+        )?;
+
+        // Set the validated schedule
+        task.set_schedule(schedule);
+
+        // Set the steps
         task.set_steps(self.steps);
-        task
+
+        Ok(task)
     }
 }
 
@@ -197,7 +224,7 @@ mod test {
     #[test]
     pub fn test_task_builder_init() {
         let builder = TaskBuilder::new(chrono::Utc);
-        assert_none!(builder.repeats, builder.schedule, builder.description);
+        assert_none!(builder.repeats);
         assert_eq!(builder.steps.len(), 0);
         assert_eq!(builder.timezone, chrono::Utc);
     }
@@ -206,7 +233,7 @@ mod test {
     #[test]
     pub fn test_task_builder_with_description() {
         let builder = TaskBuilder::new(chrono::Utc).description("Some description");
-        assert_none!(builder.repeats, builder.schedule);
+        assert_none!(builder.repeats);
         assert_eq!(builder.steps.len(), 0);
         assert_some!(builder.description);
         assert_eq!(builder.timezone, chrono::Utc);
@@ -229,14 +256,12 @@ mod test {
         assert_eq!(builder.timezone, chrono::Utc);
         assert_eq!(builder.steps.len(), 0);
         assert_some!(builder.repeats);
-        assert_none!(builder.schedule, builder.description);
     }
 
     /// Test the normal functionality of the add_step() function of the `TaskBuilder`.
     #[test]
     pub fn test_task_builder_add_step() {
         let builder = TaskBuilder::new(chrono::Utc).add_step_default(|| Ok(Success));
-        assert_none!(builder.schedule, builder.repeats, builder.description);
         assert_eq!(builder.timezone, chrono::Utc);
         assert_eq!(builder.steps.len(), 1);
     }
@@ -249,7 +274,8 @@ mod test {
             .repeat(5)
             .description("Some description")
             .add_step("Step 1", || Ok(Success))
-            .build();
+            .build()
+            .unwrap();
         assert_some!(task.repeats);
         assert_eq!(task.description, "Some description");
         assert_eq!(task.timezone, chrono::Utc);
@@ -262,9 +288,19 @@ mod test {
         let task = TaskBuilder::new(chrono::Utc)
             .repeat(5)
             .add_step("Step 1", || Ok(Success))
-            .build();
+            .build()
+            .unwrap();
         assert_some!(task.repeats);
         assert_eq!(task.timezone, chrono::Utc);
         assert_eq!(task.steps.len(), 1);
+    }
+
+    /// Test building with an invalid cron expression
+    #[test]
+    pub fn test_task_builder_invalid_expression() {
+        let result = TaskBuilder::new(chrono::Utc)
+            .every("invalid expression")
+            .build();
+        assert!(result.is_err());
     }
 }

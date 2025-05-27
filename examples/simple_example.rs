@@ -32,6 +32,7 @@ async fn main() {
                 })
                 .build(),
         )
+        .unwrap()
         .add_task(
             TaskBuilder::new(chrono::Utc)
                 .every("1, 10 , 20 * * * * * *")
@@ -41,7 +42,8 @@ async fn main() {
                     Ok(Success)
                 })
                 .build(),
-        );
+        )
+        .unwrap();
 
     // Execute the tasks in the queue.
     scheduler.run().await;
