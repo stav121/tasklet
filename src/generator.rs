@@ -16,7 +16,7 @@ where
     T: TimeZone + Send + 'static,
 {
     /// The discovery function, used to retrieve new tasks.
-    discovery_function: Box<dyn (FnMut() -> Option<TaskResult<Task<T>>>)>,
+    discovery_function: Box<dyn FnMut() -> Option<TaskResult<Task<T>>>>,
     /// The execution schedule.
     schedule: Schedule,
     /// The task generator's timezone.

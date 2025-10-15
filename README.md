@@ -22,11 +22,11 @@ in order to run tasks asynchronously.
 | library   | version |
 |-----------|---------|
 | cron      | 0.15.0  |
-| chrono    | 0.4.41  |
-| log       | 0.4.27  |
-| tokio     | 1.45.1  |
+| chrono    | 0.4.42  |
+| log       | 0.4.28  |
+| tokio     | 1.48.0  |
 | futures   | 0.3.31  |
-| thiserror | 2.0.12  |
+| thiserror | 2.0.17  |
 
 ## How to use this library
 
@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.2.9"
+tasklet = "0.2.10"
 ```
 
 ## Example
