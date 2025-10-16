@@ -1,11 +1,11 @@
 use crate::errors::{TaskError, TaskResult};
 use crate::generator::TaskGenerator;
 use crate::task::{run_task, Status, Task, TaskCmd, TaskResponse};
+use crate::{scheduler_log, task_log};
 use chrono::prelude::*;
 use chrono::Utc;
 use futures::future::join_all;
 use futures::StreamExt;
-use log::{debug, error, info};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -210,13 +210,14 @@ where
             if res.status == Status::Finished || res.status == Status::ForceRemoved {
                 for handle in &self.handles {
                     if handle.id == res.id {
-                        debug!(
-                            "Killing task {} due {}",
+                        task_log!(
                             res.id,
+                            log::Level::Debug,
+                            "Killing task due to {}",
                             if res.status == Status::Finished {
-                                "to end of execution circle."
+                                "end of execution cycle"
                             } else {
-                                "force removal."
+                                "force removal"
                             }
                         );
                         handle.handle.abort();
@@ -263,16 +264,19 @@ where
                             .iter_mut()
                             .filter(|h| h.id == r.id)
                             .for_each(|h| {
-                                info!("Task with id {} initialized", h.id);
+                                task_log!(h.id, log::Level::Info, "Initialized");
                                 h.is_init = true;
                             });
                     }
                     _ => {
-                        error!("Task with id {} failed to initialize", r.id);
+                        task_log!(r.id, log::Level::Error, "Failed to initialize");
                     }
                 },
                 Err(_) => {
-                    error!("RecvError returned by at least one uninitialized task")
+                    scheduler_log!(
+                        log::Level::Error,
+                        "RecvError returned by at least one uninitialized task"
+                    );
                 }
             });
         }
@@ -307,8 +311,9 @@ where
     ///
     /// If there is a task generation/discovery method provided, executed on every loop.
     pub async fn run(&mut self) {
-        info!(
-            "Scheduler started. Total tasks currently in queue: {}",
+        scheduler_log!(
+            log::Level::Info,
+            "Scheduler started. Total tasks in queue: {}",
             self.handles.len()
         );
 
@@ -322,12 +327,18 @@ where
             }
             match self.execute_tasks().await {
                 ExecutionStatus::Success(c) => {
-                    info!("Execution round run successfully for {} total task(s)", c);
+                    scheduler_log!(
+                        log::Level::Info,
+                        "Execution round completed successfully for {} task(s)",
+                        c
+                    );
                 }
                 ExecutionStatus::HadError(c, e) => {
-                    error!(
-                        "Execution round executed {} total task(s) and had {} total error(s)",
-                        c, e
+                    scheduler_log!(
+                        log::Level::Error,
+                        "Execution round ran {} task(s) with {} error(s)",
+                        c,
+                        e
                     );
                 }
                 _ => { /* No executions */ }

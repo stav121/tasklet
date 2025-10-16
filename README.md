@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.2.10"
+tasklet = "0.2.11"
 ```
 
 ## Example

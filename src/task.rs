@@ -2,10 +2,10 @@ extern crate chrono;
 extern crate cron;
 
 use crate::errors::{TaskError, TaskResult};
+use crate::{step_log, task_log};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use log::{debug, error, warn};
 use std::fmt::{self, Debug};
 use tokio::sync::{mpsc, oneshot};
 
@@ -314,7 +314,7 @@ where
     ///
     /// * id - The task's id.
     pub(crate) fn init(&mut self) {
-        debug!("Task with id {} is initializing", self.task_id);
+        task_log!(self.task_id, log::Level::Debug, "Initializing");
         self.next_exec = Some(
             self.schedule
                 .upcoming(self.timezone.clone())
@@ -322,7 +322,7 @@ where
                 .unwrap(),
         );
         self.status = Status::Scheduled;
-        debug!("Task with id {} finished initializing", self.task_id);
+        task_log!(self.task_id, log::Level::Debug, "Finished initializing");
     }
 
     /// Create a `TaskResponse` from the current state of the task.
@@ -370,9 +370,11 @@ where
             Status::Finished => Err(TaskError::Finished),
             Status::ForceRemoved => Err(TaskError::ForceRemoved),
             Status::Scheduled => {
-                debug!(
-                    "[Task {}] [{}] is been executed...",
-                    self.task_id, self.description
+                task_log!(
+                    self.task_id,
+                    log::Level::Debug,
+                    "Executing '{}'",
+                    self.description
                 );
                 let mut had_error: bool = false;
                 for (index, step) in self.steps.iter_mut().enumerate() {
@@ -380,8 +382,20 @@ where
                         match (step.function)() {
                             Ok(status) => {
                                 match status {
-                                    TaskStepStatusOk::Success => debug!("[Task step {}-{}] [{}] Executed successfully",self.task_id, index, step),
-                                    TaskStepStatusOk::HadErrors => debug!("[Task step {}-{}] [{}] Executed successfully but had some non fatal errors",self.task_id, index, step)
+                                    TaskStepStatusOk::Success => step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Debug,
+                                        "Executed successfully - {}",
+                                        step
+                                    ),
+                                    TaskStepStatusOk::HadErrors => step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Debug,
+                                        "Executed with non-fatal errors - {}",
+                                        step
+                                    ),
                                 }
                                 self.status = Status::Executed
                             }
@@ -390,14 +404,23 @@ where
                                 had_error = true;
                                 match status {
                                     TaskStepStatusErr::Error => {
-                                        error!(
-                                            "[Task step {}-{}] [{}] Execution failed",
-                                            self.task_id, index, step
+                                        step_log!(
+                                            self.task_id,
+                                            index,
+                                            log::Level::Error,
+                                            "Execution failed - {}",
+                                            step
                                         );
                                         self.status = Status::Failed
                                     }
                                     TaskStepStatusErr::ErrorDelete => {
-                                        error!("[Task step {}-{}] [{}] Execution failed and the task is marked for deletion",self.task_id, index, step);
+                                        step_log!(
+                                            self.task_id,
+                                            index,
+                                            log::Level::Error,
+                                            "Execution failed and task is marked for deletion - {}",
+                                            step
+                                        );
                                         self.status = Status::ForceRemoved
                                     }
                                 }
@@ -432,12 +455,13 @@ where
                 self.status = match self.repeats {
                     Some(t) => {
                         if t > 0 {
-                            debug!("[Task {}] Has been rescheduled", self.task_id);
+                            task_log!(self.task_id, log::Level::Debug, "Has been rescheduled");
                             Status::Scheduled
                         } else {
-                            warn!(
-                                "[Task  {}] Has finished its execution cycle and will be removed",
-                                self.task_id
+                            task_log!(
+                                self.task_id,
+                                log::Level::Warn,
+                                "Has finished its execution cycle and will be removed"
                             );
                             Status::Finished
                         }
@@ -447,9 +471,10 @@ where
                 Ok(())
             }
             Status::Finished | Status::ForceRemoved => {
-                warn!(
-                    "[Task {}] The task will be removed from the queue",
-                    self.task_id
+                task_log!(
+                    self.task_id,
+                    log::Level::Warn,
+                    "Will be removed from the queue"
                 );
                 Ok(())
             }
