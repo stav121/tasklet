@@ -1,11 +1,11 @@
 extern crate chrono;
 extern crate cron;
 use crate::errors::TaskResult;
+use crate::scheduler_log;
 use crate::task::Task;
 use chrono::prelude::*;
 use chrono::DateTime;
 use cron::Schedule;
-use log::debug;
 
 /// Task generation structure.
 ///
@@ -62,16 +62,16 @@ where
 
     /// Run the discovery function and reschedule the generation function.
     pub(crate) fn run(&mut self) -> Option<TaskResult<Task<T>>> {
-        debug!("Executing discovery function");
+        scheduler_log!(log::Level::Debug, "Executing task discovery function");
         self.next_exec = self.schedule.upcoming(self.timezone.clone()).next()?;
         match (self.discovery_function)() {
             Some(t) => {
                 // A task was generated and must be returned.
-                debug!("A task was found, adding it to the queue...");
+                scheduler_log!(log::Level::Debug, "Task discovered, adding to queue");
                 Some(t)
             }
             None => {
-                debug!("No task was generated");
+                scheduler_log!(log::Level::Debug, "No tasks were generated");
                 None
             }
         }
