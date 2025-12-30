@@ -303,4 +303,21 @@ mod test {
             .build();
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_task_builder_invalid_schedule() {
+        // Test with valid schedule
+        let result = TaskBuilder::new(chrono::Utc).every("* * * * * * *").build();
+        assert!(result.is_ok());
+
+        // Test with invalid schedule
+        let result = TaskBuilder::new(chrono::Utc).every("invalid cron").build();
+        assert!(result.is_err());
+
+        // Test that the error is the correct type
+        match result {
+            Err(TaskError::InvalidCronExpression(_)) => {} // Expected
+            _ => panic!("Expected InvalidCronExpression error"),
+        }
+    }
 }

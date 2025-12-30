@@ -105,4 +105,31 @@ mod test {
         let mut task_gen = TaskGenerator::new("* * * * * * *", Local, || None);
         assert!(task_gen.run().is_none());
     }
+
+    #[test]
+    fn test_task_generator_scheduling() {
+        use chrono::Duration;
+
+        // Create a generator that executes every second
+        let mut generator = TaskGenerator::new("* * * * * * *", Utc, || {
+            Some(Task::new("* * * * * * *", None, None, Utc))
+        });
+
+        // Initial execution time should be within the next second
+        let now = Utc::now();
+        let expected_window_end = now + Duration::seconds(1);
+
+        assert!(generator.next_exec >= now);
+        assert!(generator.next_exec <= expected_window_end);
+
+        // After running, the next execution should be scheduled
+        let _ = generator.run();
+
+        // The next execution should be after the current time
+        assert!(generator.next_exec > now);
+
+        // The next execution should be within a second of the previous one
+        let second_execution_window_end = generator.next_exec + Duration::seconds(1);
+        assert!(generator.next_exec <= second_execution_window_end);
+    }
 }

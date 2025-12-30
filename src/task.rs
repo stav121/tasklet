@@ -682,4 +682,222 @@ mod test {
             TaskError::InvalidCronExpression(_)
         ));
     }
+
+    #[test]
+    fn test_task_status_transitions() {
+        let mut task = Task::new(
+            "* * * * * * *",
+            Some("Status transition test"),
+            Some(1),
+            Local,
+        )
+        .unwrap();
+
+        // Initial status should be Init
+        assert_eq!(task.status, Status::Init);
+
+        // After init(), status should be Scheduled
+        task.init();
+        assert_eq!(task.status, Status::Scheduled);
+
+        // Add a step that succeeds
+        task.add_step_default(|| Ok(TaskStepStatusOk::Success));
+
+        // After run_task(), status should be Executed
+        assert!(task.run_task().is_ok());
+        assert_eq!(task.status, Status::Executed);
+
+        // After reschedule(), with repeats=1 and already executed once,
+        // status should be Finished
+        assert!(task.reschedule().is_ok());
+        assert_eq!(task.status, Status::Finished);
+    }
+
+    #[test]
+    fn test_task_step_display() {
+        // Test with description
+        let step_with_desc = TaskStep::new("Test step", || Ok(TaskStepStatusOk::Success));
+        assert_eq!(format!("{}", step_with_desc), "Test step");
+
+        // Test without description
+        let step_no_desc = TaskStep::default(|| Ok(TaskStepStatusOk::Success));
+        assert_eq!(format!("{}", step_no_desc), "-");
+
+        // Test with empty description
+        let step_empty_desc = TaskStep::new("", || Ok(TaskStepStatusOk::Success));
+        assert_eq!(format!("{}", step_empty_desc), "-");
+    }
+
+    #[tokio::test]
+    async fn test_task_command_execution() {
+        use chrono::Duration;
+        use tokio::sync::oneshot;
+
+        let mut task = Task::new("* * * * * * *", Some("Command test"), Some(1), Utc).unwrap();
+        task.set_id(1);
+
+        // Add a simple step to ensure the Run command works properly
+        task.add_step("Test step", || Ok(TaskStepStatusOk::Success));
+
+        // Test Init command first - this should initialize the task
+        let (tx_init, rx_init) = oneshot::channel();
+        task.execute_command(TaskCmd::Init { sender: tx_init });
+        let init_response = rx_init.await.unwrap();
+        assert_eq!(init_response.id, 1);
+        assert_eq!(init_response.status, Status::Scheduled);
+
+        // Set next_exec to a future time to prevent automatic execution
+        let future_time = Utc::now() + Duration::seconds(10);
+        task.next_exec = Some(future_time);
+
+        // Send Run command - this should not execute the task since next_exec is in the future
+        let (tx_run_no_exec, rx_run_no_exec) = oneshot::channel();
+        task.execute_command(TaskCmd::Run {
+            sender: tx_run_no_exec,
+        });
+        let no_exec_response = rx_run_no_exec.await.unwrap();
+        assert_eq!(no_exec_response.id, 1);
+        assert_eq!(
+            no_exec_response.status,
+            Status::Scheduled,
+            "Task should remain Scheduled when next_exec is in the future"
+        );
+
+        // Set next_exec to a past time to allow execution
+        let past_time = Utc::now() - Duration::seconds(10);
+        task.next_exec = Some(past_time);
+
+        // Send Run command - this should execute the task
+        let (tx_run, rx_run) = oneshot::channel();
+        task.execute_command(TaskCmd::Run { sender: tx_run });
+        let run_response = rx_run.await.unwrap();
+        assert_eq!(run_response.id, 1);
+        assert_eq!(run_response.status, Status::Executed);
+
+        // Test Reschedule command
+        let (tx_reschedule, rx_reschedule) = oneshot::channel();
+        task.execute_command(TaskCmd::Reschedule {
+            sender: tx_reschedule,
+        });
+        let reschedule_response = rx_reschedule.await.unwrap();
+        assert_eq!(reschedule_response.id, 1);
+        assert_eq!(reschedule_response.status, Status::Finished);
+    }
+
+    #[test]
+    fn test_task_multiple_steps_execution() {
+        use std::sync::{Arc, Mutex};
+
+        // Create counters to track step execution
+        let counter1 = Arc::new(Mutex::new(0));
+        let counter2 = Arc::new(Mutex::new(0));
+        let counter3 = Arc::new(Mutex::new(0));
+
+        // Create a task with multiple steps
+        let mut task = Task::new("* * * * * * *", Some("Multiple steps"), Some(1), Local).unwrap();
+
+        // Add steps that increment counters
+        let c1 = counter1.clone();
+        task.add_step("Step 1", move || {
+            *c1.lock().unwrap() += 1;
+            Ok(TaskStepStatusOk::Success)
+        });
+
+        let c2 = counter2.clone();
+        task.add_step("Step 2", move || {
+            *c2.lock().unwrap() += 1;
+            Ok(TaskStepStatusOk::Success)
+        });
+
+        let c3 = counter3.clone();
+        task.add_step("Step 3", move || {
+            *c3.lock().unwrap() += 1;
+            Ok(TaskStepStatusOk::Success)
+        });
+
+        // Initialize and run
+        task.init();
+        assert!(task.run_task().is_ok());
+
+        // Verify all steps executed
+        assert_eq!(*counter1.lock().unwrap(), 1);
+        assert_eq!(*counter2.lock().unwrap(), 1);
+        assert_eq!(*counter3.lock().unwrap(), 1);
+
+        // Verify final status
+        assert_eq!(task.status, Status::Executed);
+    }
+
+    #[test]
+    fn test_task_step_failure_scenarios() {
+        use std::sync::{Arc, Mutex};
+
+        // Create a counter to verify which steps executed
+        let execution_counter = Arc::new(Mutex::new(Vec::new()));
+
+        // Create a task with three steps, where the second step fails
+        let mut task = Task::new("* * * * * * *", Some("Failure test"), None, Local).unwrap();
+
+        // First step succeeds
+        let counter = execution_counter.clone();
+        task.add_step("Step 1", move || {
+            counter.lock().unwrap().push(1);
+            Ok(TaskStepStatusOk::Success)
+        });
+
+        // Second step fails
+        let counter = execution_counter.clone();
+        task.add_step("Step 2", move || {
+            counter.lock().unwrap().push(2);
+            Err(TaskStepStatusErr::Error)
+        });
+
+        // Third step should not execute due to previous failure
+        let counter = execution_counter.clone();
+        task.add_step("Step 3", move || {
+            counter.lock().unwrap().push(3);
+            Ok(TaskStepStatusOk::Success)
+        });
+
+        // Initialize and run
+        task.init();
+        assert!(task.run_task().is_ok());
+
+        // Verify only steps 1 and 2 executed
+        assert_eq!(*execution_counter.lock().unwrap(), vec![1, 2]);
+
+        // Verify task is in Failed state
+        assert_eq!(task.status, Status::Failed);
+    }
+
+    #[test]
+    fn test_force_removal() {
+        // Create a task with a step that forces removal
+        let mut task = Task::new("* * * * * * *", Some("Force removal"), None, Local).unwrap();
+        task.add_step("Failing step", || Err(TaskStepStatusErr::ErrorDelete));
+
+        // Initialize and run
+        task.init();
+        assert!(task.run_task().is_ok());
+
+        // Verify task is marked for force removal
+        assert_eq!(task.status, Status::ForceRemoved);
+
+        // Verify reschedule respects force removal status
+        assert!(task.reschedule().is_ok());
+        assert_eq!(task.status, Status::ForceRemoved);
+    }
+
+    #[test]
+    fn test_empty_task_execution() {
+        // Create a task with no steps
+        let mut task = Task::new("* * * * * * *", Some("Empty task"), None, Local).unwrap();
+
+        // Initialize and run
+        task.init();
+        assert!(task.run_task().is_ok());
+
+        // Verify task is marked as Executed even with no steps
+        assert_eq!(task.status, Status::Executed);
+    }
 }

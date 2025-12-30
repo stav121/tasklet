@@ -23,7 +23,7 @@ in order to run tasks asynchronously.
 |-----------|---------|
 | cron      | 0.15.0  |
 | chrono    | 0.4.42  |
-| log       | 0.4.28  |
+| log       | 0.4.29  |
 | tokio     | 1.48.0  |
 | futures   | 0.3.31  |
 | thiserror | 2.0.17  |
@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.2.11"
+tasklet = "0.2.12"
 ```
 
 ## Example
