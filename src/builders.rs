@@ -122,11 +122,14 @@ where
     /// ```rust
     /// # use tasklet::task::TaskStepStatusErr::Error;
     /// # use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || Err(Error));
+    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || async { Err(Error) });
     /// ```
-    pub fn add_step<F>(mut self, description: &str, function: F) -> TaskBuilder<T>
+    pub fn add_step<F, Fut>(mut self, description: &str, function: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + Send + 'static,
+        F: (FnMut() -> Fut) + Send + 'static,
+        Fut: std::future::Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>>
+            + Send
+            + 'static,
     {
         self.steps.push(TaskStep::new(description, function));
         self
@@ -141,11 +144,14 @@ where
     /// ```
     /// # use tasklet::task::TaskStepStatusOk::Success;
     /// use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Local).add_step_default(|| Ok(Success));
+    /// let _ = TaskBuilder::new(chrono::Local).add_step_default(|| async { Ok(Success) });
     /// ```
-    pub fn add_step_default<F>(mut self, function: F) -> TaskBuilder<T>
+    pub fn add_step_default<F, Fut>(mut self, function: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: std::future::Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>>
+            + Send
+            + 'static,
     {
         self.steps.push(TaskStep::default(function));
         self
@@ -261,7 +267,7 @@ mod test {
     /// Test the normal functionality of the add_step() function of the `TaskBuilder`.
     #[test]
     pub fn test_task_builder_add_step() {
-        let builder = TaskBuilder::new(chrono::Utc).add_step_default(|| Ok(Success));
+        let builder = TaskBuilder::new(chrono::Utc).add_step_default(|| async { Ok(Success) });
         assert_eq!(builder.timezone, chrono::Utc);
         assert_eq!(builder.steps.len(), 1);
     }
@@ -273,7 +279,7 @@ mod test {
             .every("* * * * * * *")
             .repeat(5)
             .description("Some description")
-            .add_step("Step 1", || Ok(Success))
+            .add_step("Step 1", || async { Ok(Success) })
             .build()
             .unwrap();
         assert_some!(task.repeats);
@@ -287,7 +293,7 @@ mod test {
     pub fn test_task_builder_build_default() {
         let task = TaskBuilder::new(chrono::Utc)
             .repeat(5)
-            .add_step("Step 1", || Ok(Success))
+            .add_step("Step 1", || async { Ok(Success) })
             .build()
             .unwrap();
         assert_some!(task.repeats);

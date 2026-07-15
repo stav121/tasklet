@@ -3,6 +3,34 @@
 //! `tasklet` allows you to create scheduled tasks with specific execution patterns and
 //! run them asynchronously using Tokio. It supports cron-like scheduling expressions and
 //! provides a builder pattern for easy task creation.
+//!
+//! # Highlights
+//!
+//! * **Async steps** — every task step is a closure returning a future, so steps can
+//!   `.await` real asynchronous work (I/O, timers, ...) without blocking the runtime.
+//! * **Graceful shutdown** — obtain a [`scheduler::SchedulerHandle`] via
+//!   [`TaskScheduler::handle`] before running and call `shutdown()` to stop the scheduler
+//!   cleanly, or drive shutdown with any future via [`TaskScheduler::run_until`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use tasklet::task::TaskStepStatusOk::Success;
+//! use tasklet::{TaskBuilder, TaskScheduler};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let mut scheduler = TaskScheduler::default(chrono::Local);
+//!     let _ = scheduler.add_task(
+//!         TaskBuilder::new(chrono::Local)
+//!             .every("1 * * * * * *")
+//!             .description("A simple task")
+//!             .add_step("Step 1", || async { Ok(Success) })
+//!             .build(),
+//!     );
+//!     scheduler.run().await;
+//! }
+//! ```
 
 mod builders;
 pub mod errors;

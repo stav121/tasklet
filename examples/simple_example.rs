@@ -26,9 +26,12 @@ async fn main() {
                 .description("Just some task")
                 .repeat(5)
                 .add_step_default(move || {
-                    count = count - 1;
-                    info!("I have {} more executions left!", count);
-                    Ok(Success)
+                    count -= 1;
+                    let remaining = count;
+                    async move {
+                        info!("I have {} more executions left!", remaining);
+                        Ok(Success)
+                    }
                 })
                 .build(),
         )
@@ -37,7 +40,7 @@ async fn main() {
             TaskBuilder::new(chrono::Utc)
                 .every("1, 10 , 20 * * * * * *")
                 .description("Just another task")
-                .add_step_default(|| {
+                .add_step_default(|| async {
                     info!("I will run forever!");
                     Ok(Success)
                 })

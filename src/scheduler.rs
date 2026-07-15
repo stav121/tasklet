@@ -6,9 +6,10 @@ use chrono::prelude::*;
 use chrono::Utc;
 use futures::future::join_all;
 use futures::StreamExt;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 /// Task execution possible statuses.
@@ -33,6 +34,48 @@ pub struct TaskHandle {
     is_init: bool,
 }
 
+/// A cloneable handle used to control a running [`TaskScheduler`].
+///
+/// Obtain one with [`TaskScheduler::handle`] *before* calling
+/// [`TaskScheduler::run`], then call [`SchedulerHandle::shutdown`] from anywhere
+/// (another task, a signal handler, etc.) to request a graceful stop.
+///
+/// # Examples
+///
+/// ```
+/// # use tasklet::TaskScheduler;
+/// # tokio_test::block_on(async {
+/// let mut scheduler = TaskScheduler::default(chrono::Utc);
+/// let handle = scheduler.handle();
+///
+/// // Stop the scheduler shortly after it starts.
+/// let stopper = tokio::spawn(async move {
+///     handle.shutdown();
+/// });
+///
+/// scheduler.run().await; // returns once the shutdown is requested
+/// stopper.await.unwrap();
+/// # });
+/// ```
+#[derive(Clone, Debug)]
+pub struct SchedulerHandle {
+    notify: Arc<Notify>,
+}
+
+impl SchedulerHandle {
+    /// Request a graceful shutdown of the associated scheduler.
+    ///
+    /// The scheduler finishes the current execution round, drains its tasks and
+    /// returns from [`TaskScheduler::run`]. Calling this before the scheduler
+    /// starts is fine — the request is remembered and the loop exits on its first
+    /// idle window.
+    pub fn shutdown(&self) {
+        // `notify_one` stores a permit if there is no current waiter, so a shutdown
+        // requested before `run()` reaches its await point is not lost.
+        self.notify.notify_one();
+    }
+}
+
 /// Task scheduler and executor.
 pub struct TaskScheduler<T>
 where
@@ -48,12 +91,15 @@ where
     next_id: usize,
     /// The main timezone used for the scheduler.
     timezone: T,
+    /// Notified when a graceful shutdown is requested.
+    shutdown: Arc<Notify>,
 }
 
 /// `TaskScheduler` implementation.
 impl<T> TaskScheduler<T>
 where
     T: TimeZone + Clone + Send + 'static,
+    <T as TimeZone>::Offset: Send,
 {
     /// Create a new instance of `TaskSchedule` with default sleep and no tasks to execute.
     ///
@@ -75,6 +121,22 @@ where
             sleep: 1000,
             timezone,
             next_id: 0,
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Return a cloneable [`SchedulerHandle`] that can request a graceful shutdown.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// let scheduler = TaskScheduler::default(chrono::Utc);
+    /// let _handle = scheduler.handle();
+    /// ```
+    pub fn handle(&self) -> SchedulerHandle {
+        SchedulerHandle {
+            notify: self.shutdown.clone(),
         }
     }
 
@@ -111,7 +173,7 @@ where
     /// # use tasklet::{TaskScheduler, TaskGenerator};
     /// // Create a new `TaskScheduler` instance and attach an `TaskGenerator` to it.
     /// let mut scheduler = TaskScheduler::default(chrono::Local);
-    /// let mut generator = TaskGenerator::new("1 * * * * * *", chrono::Local, || None);
+    /// let generator = TaskGenerator::new("1 * * * * * *", chrono::Local, || None).unwrap();
     /// scheduler.set_task_gen(generator);
     /// ```
     pub fn set_task_gen(&mut self, task_gen: TaskGenerator<T>) -> &mut TaskScheduler<T> {
@@ -181,7 +243,19 @@ where
         let total_runs: Arc<Mutex<usize>> = Arc::new(Mutex::new(0usize));
         futures::stream::iter(receivers)
             .for_each(|r| async {
-                match r.await.unwrap().status {
+                // A task whose sender was dropped (e.g. it panicked) yields a
+                // `RecvError`; log and skip it rather than bringing down the scheduler.
+                let status = match r.await {
+                    Ok(response) => response.status,
+                    Err(_) => {
+                        scheduler_log!(
+                            log::Level::Error,
+                            "A task failed to report its run status and will be skipped"
+                        );
+                        return;
+                    }
+                };
+                match status {
                     Status::Executed => {
                         *total_runs.lock().unwrap() += 1;
                     }
@@ -206,7 +280,16 @@ where
         }
 
         for recv in receivers {
-            let res = recv.await.unwrap();
+            let res = match recv.await {
+                Ok(res) => res,
+                Err(_) => {
+                    scheduler_log!(
+                        log::Level::Error,
+                        "A task failed to report its reschedule status and will be skipped"
+                    );
+                    continue;
+                }
+            };
             if res.status == Status::Finished || res.status == Status::ForceRemoved {
                 for handle in &self.handles {
                     if handle.id == res.id {
@@ -304,47 +387,120 @@ where
         }
     }
 
+    /// Abort every registered task and clear the handle list.
+    ///
+    /// Used on shutdown to drain the scheduler cleanly. Each task is just parked on
+    /// its receiver, so aborting is safe.
+    fn shutdown_tasks(&mut self) {
+        for handle in &self.handles {
+            handle.handle.abort();
+        }
+        self.handles.clear();
+    }
+
+    /// Run one iteration of the scheduler flow: run the generator (if due),
+    /// (re)initialize tasks and execute the current round.
+    async fn tick(&mut self) {
+        if self.run_task_gen() {
+            // Re-initialize the tasks if any new is added
+            self.init_tasks().await;
+        }
+        match self.execute_tasks().await {
+            ExecutionStatus::Success(c) => {
+                scheduler_log!(
+                    log::Level::Info,
+                    "Execution round completed successfully for {} task(s)",
+                    c
+                );
+            }
+            ExecutionStatus::HadError(c, e) => {
+                scheduler_log!(
+                    log::Level::Error,
+                    "Execution round ran {} task(s) with {} error(s)",
+                    c,
+                    e
+                );
+            }
+            _ => { /* No executions */ }
+        }
+    }
+
     /// Main execution loop.
     ///
-    /// Executes the main flow of the scheduler.
-    /// At first initialize all the tasks and then run the execution loop.
+    /// Executes the main flow of the scheduler until a shutdown is requested through a
+    /// [`SchedulerHandle`] obtained via [`TaskScheduler::handle`]. If no handle is ever
+    /// used to request a shutdown, this runs forever.
     ///
-    /// If there is a task generation/discovery method provided, executed on every loop.
+    /// At first all the tasks are initialized and then the execution loop is entered.
+    /// If a task generation/discovery method is provided, it is executed on every loop.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// # tokio_test::block_on(async {
+    /// let mut scheduler = TaskScheduler::default(chrono::Utc);
+    /// let handle = scheduler.handle();
+    /// tokio::spawn(async move { handle.shutdown(); });
+    /// scheduler.run().await;
+    /// # });
+    /// ```
     pub async fn run(&mut self) {
+        let shutdown = self.shutdown.clone();
+        self.run_until(async move { shutdown.notified().await })
+            .await;
+    }
+
+    /// Run the scheduler until the provided `shutdown` future resolves.
+    ///
+    /// This is the general form of [`TaskScheduler::run`]; it lets callers drive the
+    /// shutdown with any future, for example an OS signal such as `ctrl_c`. When the
+    /// future resolves the current round finishes, the tasks are drained and this
+    /// returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// # use std::time::Duration;
+    /// # tokio_test::block_on(async {
+    /// let mut scheduler = TaskScheduler::new(50, chrono::Utc);
+    /// // Stop after a short while.
+    /// scheduler
+    ///     .run_until(tokio::time::sleep(Duration::from_millis(120)))
+    ///     .await;
+    /// # });
+    /// ```
+    pub async fn run_until<F>(&mut self, shutdown: F)
+    where
+        F: Future<Output = ()>,
+    {
         scheduler_log!(
             log::Level::Info,
             "Scheduler started. Total tasks in queue: {}",
             self.handles.len()
         );
 
+        tokio::pin!(shutdown);
+
         // Initialize the tasks
         self.init_tasks().await;
 
         loop {
-            if self.run_task_gen() {
-                // Re-initialize the tasks if any new is added
-                self.init_tasks().await;
-            }
-            match self.execute_tasks().await {
-                ExecutionStatus::Success(c) => {
-                    scheduler_log!(
-                        log::Level::Info,
-                        "Execution round completed successfully for {} task(s)",
-                        c
-                    );
+            self.tick().await;
+            // Sleep between rounds, but wake up early if a shutdown is requested.
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    scheduler_log!(log::Level::Info, "Shutdown requested, stopping scheduler");
+                    break;
                 }
-                ExecutionStatus::HadError(c, e) => {
-                    scheduler_log!(
-                        log::Level::Error,
-                        "Execution round ran {} task(s) with {} error(s)",
-                        c,
-                        e
-                    );
-                }
-                _ => { /* No executions */ }
+                _ = tokio::time::sleep(Duration::from_millis(self.sleep as u64)) => {}
             }
-            tokio::time::sleep(Duration::from_millis(self.sleep as u64)).await;
         }
+
+        self.shutdown_tasks();
+        scheduler_log!(log::Level::Info, "Scheduler stopped");
     }
 }
 
@@ -386,7 +542,7 @@ mod test {
         let mut scheduler = TaskScheduler::new(500, Local);
         // Create a task.
         let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
-        task.add_step_default(|| Err(ErrorDelete));
+        task.add_step_default(|| async { Err(ErrorDelete) });
         // Add a couple of tasks.
         scheduler
             .add_task(Ok(task))
@@ -425,9 +581,9 @@ mod test {
 
         // Create a task.
         let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
-        task.add_step_default(|| Ok(Success));
+        task.add_step_default(|| async { Ok(Success) });
         // Return an error in the second step.
-        task.add_step_default(|| Err(Error));
+        task.add_step_default(|| async { Err(Error) });
 
         // Add a task.
         scheduler.add_task(Ok(task)).unwrap();
@@ -446,7 +602,7 @@ mod test {
         let mut scheduler = TaskScheduler::new(500, Local);
 
         // Add a task generator function that does now.
-        scheduler.set_task_gen(TaskGenerator::new("* * * * * * *", Local, || None));
+        scheduler.set_task_gen(TaskGenerator::new("* * * * * * *", Local, || None).unwrap());
 
         // Should start with zero tasks.
         assert_eq!(scheduler.handles.len(), 0);
@@ -459,13 +615,16 @@ mod test {
         assert_eq!(scheduler.handles.len(), 0);
 
         // Update the generator to actually create a new task.
-        scheduler.set_task_gen(TaskGenerator::new("* * * * * * *", Local, || {
-            // Run at second "1" of every minute.
+        scheduler.set_task_gen(
+            TaskGenerator::new("* * * * * * *", Local, || {
+                // Run at second "1" of every minute.
 
-            // Create the task that will execute 2 total times.
-            // Return the task for the execution queue.
-            Some(TaskBuilder::new(Local).every("* * * * * * *").build())
-        }));
+                // Create the task that will execute 2 total times.
+                // Return the task for the execution queue.
+                Some(TaskBuilder::new(Local).every("* * * * * * *").build())
+            })
+            .unwrap(),
+        );
 
         // Execute the task generator.
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -490,5 +649,59 @@ mod test {
             Err(TaskError::InvalidCronExpression(_)) => {} // Expected
             _ => panic!("Expected InvalidCronExpression error"),
         }
+    }
+
+    /// `run()` must return once a shutdown is requested through the handle.
+    #[tokio::test]
+    async fn test_scheduler_graceful_shutdown() {
+        let mut scheduler = TaskScheduler::new(50, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+
+        let handle = scheduler.handle();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            handle.shutdown();
+        });
+
+        // Should return in bounded time rather than looping forever.
+        tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+            .await
+            .expect("scheduler did not stop after shutdown was requested");
+        stopper.await.unwrap();
+
+        // Tasks are drained on shutdown.
+        assert_eq!(scheduler.handles.len(), 0);
+    }
+
+    /// A shutdown requested before `run()` starts must still stop the scheduler.
+    #[tokio::test]
+    async fn test_scheduler_shutdown_requested_before_run() {
+        let mut scheduler = TaskScheduler::new(50, Local);
+        let handle = scheduler.handle();
+        // Request shutdown up-front; the stored notification must not be lost.
+        handle.shutdown();
+
+        tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+            .await
+            .expect("scheduler ignored a shutdown requested before run()");
+    }
+
+    /// `run_until` stops when the provided future resolves.
+    #[tokio::test]
+    async fn test_scheduler_run_until() {
+        let mut scheduler = TaskScheduler::new(50, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(120))),
+        )
+        .await
+        .expect("run_until did not stop when its shutdown future resolved");
+        assert_eq!(scheduler.handles.len(), 0);
     }
 }
