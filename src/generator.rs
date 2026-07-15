@@ -1,6 +1,6 @@
 extern crate chrono;
 extern crate cron;
-use crate::errors::TaskResult;
+use crate::errors::{TaskError, TaskResult};
 use crate::scheduler_log;
 use crate::task::Task;
 use chrono::prelude::*;
@@ -38,26 +38,44 @@ where
     /// * function      - The discovery function.
     /// * timezone      - The generator's timezone.
     ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::InvalidCronExpression`] if `expression` is not a valid cron
+    /// expression, or if it yields no upcoming execution time.
+    ///
     /// # Examples
     ///
     /// ```
     /// # use tasklet::{TaskGenerator, Task};
     /// // Create a `TaskGenerator` instance.
     /// // It will be executed at the first second of each minute.
-    /// let _task_gen = TaskGenerator::new("1 * * * * * *", chrono::Local, || Some(Task::new("* * * * * * *", None, None, chrono::Local)));
+    /// let _task_gen = TaskGenerator::new("1 * * * * * *", chrono::Local, || Some(Task::new("* * * * * * *", None, None, chrono::Local))).unwrap();
     /// ```
-    pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskGenerator<T>
+    pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskResult<TaskGenerator<T>>
     where
         F: (FnMut() -> Option<TaskResult<Task<T>>>) + 'static,
     {
-        let schedule: Schedule = expression.parse().unwrap();
+        // Parse the cron expression a single time and surface any error.
+        let schedule: Schedule = expression.parse().map_err(|e| {
+            TaskError::InvalidCronExpression(format!(
+                "Invalid cron expression '{}': {}",
+                expression, e
+            ))
+        })?;
 
-        TaskGenerator {
+        let next_exec = schedule.upcoming(timezone.clone()).next().ok_or_else(|| {
+            TaskError::InvalidCronExpression(format!(
+                "Cron expression '{}' has no upcoming execution",
+                expression
+            ))
+        })?;
+
+        Ok(TaskGenerator {
             discovery_function: Box::new(function),
-            schedule: expression.parse().unwrap(),
-            timezone: timezone.clone(),
-            next_exec: schedule.upcoming(timezone).next().unwrap(),
-        }
+            schedule,
+            timezone,
+            next_exec,
+        })
     }
 
     /// Run the discovery function and reschedule the generation function.
@@ -92,7 +110,8 @@ mod test {
         // Create a task generation instance.
         let mut task_gen = TaskGenerator::new("* * * * * * *", Local, || {
             Some(Task::new("* * * * * * *", None, Some(1), Local))
-        });
+        })
+        .unwrap();
         assert!(task_gen.run().is_some());
     }
 
@@ -102,8 +121,19 @@ mod test {
     #[test]
     fn test_task_generation_without_result() {
         // Create a task generation instance.
-        let mut task_gen = TaskGenerator::new("* * * * * * *", Local, || None);
+        let mut task_gen = TaskGenerator::new("* * * * * * *", Local, || None).unwrap();
         assert!(task_gen.run().is_none());
+    }
+
+    /// An invalid cron expression must yield an error instead of panicking.
+    #[test]
+    fn test_task_generator_invalid_expression() {
+        let result = TaskGenerator::new("not a cron", Local, || None);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.err().unwrap(),
+            crate::errors::TaskError::InvalidCronExpression(_)
+        ));
     }
 
     #[test]
@@ -113,7 +143,8 @@ mod test {
         // Create a generator that executes every second
         let mut generator = TaskGenerator::new("* * * * * * *", Utc, || {
             Some(Task::new("* * * * * * *", None, None, Utc))
-        });
+        })
+        .unwrap();
 
         // Initial execution time should be within the next second
         let now = Utc::now();

@@ -24,18 +24,22 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step_default(|| {
+            .add_step_default(|| async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
             })
             .add_step_default(move || {
-                if exec_count % 2 == 0 {
-                    exec_count += 1;
-                    return Err(Error); // Indicate that this step was a fail.
-                }
-                info!("Hello from step 2");
+                // Snapshot the counter for this run, then advance it so the returned
+                // future can own its state and stay `'static`.
+                let count = exec_count;
                 exec_count += 1;
-                Ok(Success) // Indicate that this step was a success.
+                async move {
+                    if count % 2 == 0 {
+                        return Err(Error); // Indicate that this step was a fail.
+                    }
+                    info!("Hello from step 2");
+                    Ok(Success) // Indicate that this step was a success.
+                }
             })
             .build(),
     );

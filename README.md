@@ -34,12 +34,18 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.2.12"
+tasklet = "0.3.0"
 ```
+
+> **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
+> task steps are now `async`.
 
 ## Example
 
 Find more examples in the [examples](/examples) folder.
+
+Task steps are **asynchronous**: every step is a closure that returns a future, so it can
+`.await` real work (I/O, timers, network calls) without blocking the runtime.
 
 ```rust
 use log::info;
@@ -68,18 +74,22 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step("Step 1", || {
+            .add_step("Step 1", || async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
             })
             .add_step("Step 2", move || {
-                if exec_count % 2 == 0 {
-                    exec_count += 1;
-                    Err(Error) // Indicate that this step was a fail.
-                } else {
-                    info!("Hello from step 2");
-                    exec_count += 1;
-                    Ok(Success) // Indicate that this step was a success.
+                // Snapshot per-run state, then move it into the async block so the
+                // returned future is `'static`.
+                let count = exec_count;
+                exec_count += 1;
+                async move {
+                    if count % 2 == 0 {
+                        Err(Error) // Indicate that this step was a fail.
+                    } else {
+                        info!("Hello from step 2");
+                        Ok(Success) // Indicate that this step was a success.
+                    }
                 }
             })
             .build(),
@@ -89,6 +99,51 @@ async fn main() {
     scheduler.run().await;
 }
 ```
+
+## Graceful shutdown
+
+`scheduler.run()` normally loops forever. To stop it cleanly, grab a
+`SchedulerHandle` with `scheduler.handle()` *before* running and call `shutdown()`
+from anywhere — the current round finishes, the tasks are drained and `run()` returns:
+
+```rust,no_run
+# use tasklet::TaskScheduler;
+# #[tokio::main]
+# async fn main() {
+let mut scheduler = TaskScheduler::default(chrono::Utc);
+let handle = scheduler.handle();
+
+// Stop on Ctrl-C.
+tokio::spawn(async move {
+    tokio::signal::ctrl_c().await.ok();
+    handle.shutdown();
+});
+
+scheduler.run().await; // returns once shutdown is requested
+# }
+```
+
+You can also drive the shutdown with any future via `scheduler.run_until(future)` — for
+example a timer or an OS signal.
+
+## Migrating from 0.2.x to 0.3.0
+
+- **Steps are now async.** A step closure must return a future. Wrap synchronous bodies
+  in an `async` block:
+
+  ```rust,ignore
+  // 0.2.x
+  .add_step("Step", || Ok(Success))
+  // 0.3.0
+  .add_step("Step", || async { Ok(Success) })
+  ```
+
+  For state that changes between runs, snapshot it in the (`FnMut`) closure and `move` the
+  snapshot into the `async move` block so the future stays `'static`.
+- **`TaskGenerator::new` now returns a `Result`.** It no longer panics on an invalid cron
+  expression — call `?`/`.unwrap()` on the result.
+- **`TaskScheduler::run` can now stop.** It returns when a shutdown is requested through a
+  `SchedulerHandle`; if you never request one, behaviour is unchanged (runs forever).
 
 ## Author
 

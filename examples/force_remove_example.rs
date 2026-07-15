@@ -24,22 +24,26 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("0,5,10,15,20,25,30,35,40,45,50,55 * * * * * *")
             .description("A simple task")
-            .add_step("Step 1", || {
+            .add_step("Step 1", || async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
             })
             .add_step("Step 2", move || {
-                if exec_count == 10 {
-                    info!("Force deleting!");
-                    return Err(ErrorDelete);
-                }
-                if exec_count % 2 == 0 {
-                    exec_count += 1;
-                    Err(Error) // Indicate that this step was a fail.
-                } else {
-                    info!("Hello from step 2");
-                    exec_count += 1;
-                    Ok(Success) // Indicate that this step was a success.
+                // Snapshot the counter for this run, then advance it so the returned
+                // future can own its state and stay `'static`.
+                let count = exec_count;
+                exec_count += 1;
+                async move {
+                    if count == 10 {
+                        info!("Force deleting!");
+                        return Err(ErrorDelete);
+                    }
+                    if count % 2 == 0 {
+                        Err(Error) // Indicate that this step was a fail.
+                    } else {
+                        info!("Hello from step 2");
+                        Ok(Success) // Indicate that this step was a success.
+                    }
                 }
             })
             .build(),

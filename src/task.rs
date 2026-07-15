@@ -7,6 +7,8 @@ use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use std::fmt::{self, Debug};
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
 
 /// Possible success status values for a step's execution.
@@ -27,8 +29,17 @@ pub enum TaskStepStatusErr {
     ErrorDelete,
 }
 
-/// An executable function.
-pub type ExecutableFn = dyn FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr> + 'static + Send;
+/// The boxed future produced by a task step when it is invoked.
+///
+/// Steps are asynchronous: invoking a step returns a `Future` that is awaited by the
+/// scheduler, allowing steps to perform real async work (I/O, timers, etc.).
+pub type StepFuture =
+    Pin<Box<dyn Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send>>;
+
+/// An executable, asynchronous function.
+///
+/// Each call produces a fresh [`StepFuture`] to be awaited.
+pub type ExecutableFn = dyn FnMut() -> StepFuture + 'static + Send;
 
 /// A task step.
 ///
@@ -61,15 +72,16 @@ impl TaskStep {
     ///
     /// ```
     /// # use tasklet::task::{TaskStep, TaskStepStatusOk};
-    /// let _ = TaskStep::new("Some task", || Ok(TaskStepStatusOk::Success));
+    /// let _ = TaskStep::new("Some task", || async { Ok(TaskStepStatusOk::Success) });
     /// ```
-    pub fn new<F>(description: &str, function: F) -> Self
+    pub fn new<F, Fut>(description: &str, mut function: F) -> Self
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         Self {
             description: Some(description.to_string()),
-            function: Box::new(function),
+            function: Box::new(move || Box::pin(function())),
         }
     }
 
@@ -84,14 +96,15 @@ impl TaskStep {
     /// ```
     /// # use tasklet::task::TaskStep;
     /// use tasklet::task::TaskStepStatusOk::Success;
-    /// let _ = TaskStep::default(|| {Ok(Success)});
+    /// let _ = TaskStep::default(|| async { Ok(Success) });
     /// ```
-    pub fn default<F>(function: F) -> Self
+    pub fn default<F, Fut>(mut function: F) -> Self
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         Self {
-            function: Box::new(function),
+            function: Box::new(move || Box::pin(function())),
             description: None,
         }
     }
@@ -165,8 +178,6 @@ where
     /// Task receiver
     pub(crate) receiver: Option<mpsc::Receiver<TaskCmd>>,
 }
-
-unsafe impl<T> Send for Task<T> where T: TimeZone + Send + 'static {}
 
 impl<T> Debug for Task<T>
 where
@@ -266,9 +277,10 @@ where
     /// * description   - A short task step description (Optional).
     /// * function      - The executable function.
     #[cfg(test)]
-    pub(crate) fn add_step<F>(&mut self, description: &str, function: F) -> &mut Task<T>
+    pub(crate) fn add_step<F, Fut>(&mut self, description: &str, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         self.steps.push(TaskStep::new(description, function));
         self
@@ -280,9 +292,10 @@ where
     ///
     /// * function  - the executable function
     #[cfg(test)]
-    pub(crate) fn add_step_default<F>(&mut self, function: F) -> &mut Task<T>
+    pub(crate) fn add_step_default<F, Fut>(&mut self, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Result<TaskStepStatusOk, TaskStepStatusErr>) + 'static + Send,
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         self.steps.push(TaskStep::default(function));
         self
@@ -315,14 +328,24 @@ where
     /// * id - The task's id.
     pub(crate) fn init(&mut self) {
         task_log!(self.task_id, log::Level::Debug, "Initializing");
-        self.next_exec = Some(
-            self.schedule
-                .upcoming(self.timezone.clone())
-                .next()
-                .unwrap(),
-        );
-        self.status = Status::Scheduled;
-        task_log!(self.task_id, log::Level::Debug, "Finished initializing");
+        match self.schedule.upcoming(self.timezone.clone()).next() {
+            Some(next) => {
+                self.next_exec = Some(next);
+                self.status = Status::Scheduled;
+                task_log!(self.task_id, log::Level::Debug, "Finished initializing");
+            }
+            None => {
+                // The schedule has no upcoming execution (e.g. a cron with a fixed
+                // past year). Mark it finished so the scheduler reaps it instead of
+                // panicking on an unwrap.
+                self.status = Status::Finished;
+                task_log!(
+                    self.task_id,
+                    log::Level::Warn,
+                    "Has no upcoming execution and will be removed"
+                );
+            }
+        }
     }
 
     /// Create a `TaskResponse` from the current state of the task.
@@ -338,13 +361,23 @@ where
     /// Each of the commands triggers the underlying method of the task,
     /// and responds with the id of the task and the status of the task after the execution
     /// of the command has finished.
-    pub(crate) fn execute_command(&mut self, msg: TaskCmd) {
+    pub(crate) async fn execute_command(&mut self, msg: TaskCmd) {
         match msg {
             TaskCmd::Run { sender } => {
-                if self.next_exec.as_ref().unwrap()
-                    <= &Utc::now().with_timezone(&self.timezone.clone())
-                {
-                    let _ = self.run_task(); // Ignore the result as we already update the status
+                // Only run if the task has been scheduled (has a next execution time)
+                // and that time is due. A missing `next_exec` means the task was never
+                // initialized; skip it gracefully instead of panicking.
+                //
+                // The comparison is scoped so the borrow of `next_exec` is released
+                // before the `.await`, keeping the resulting future `Send`.
+                let due = match &self.next_exec {
+                    Some(next_exec) => {
+                        *next_exec <= Utc::now().with_timezone(&self.timezone.clone())
+                    }
+                    None => false,
+                };
+                if due {
+                    let _ = self.run_task().await; // Ignore the result as we already update the status
                 }
                 let _ = sender.send(self.get_task_response());
             }
@@ -362,7 +395,7 @@ where
     }
 
     /// Run the task and handle the output.
-    pub(crate) fn run_task(&mut self) -> TaskResult<()> {
+    pub(crate) async fn run_task(&mut self) -> TaskResult<()> {
         match &self.status {
             Status::Init => Err(TaskError::NotInitialized),
             Status::Failed => Err(TaskError::Failed),
@@ -379,7 +412,7 @@ where
                 let mut had_error: bool = false;
                 for (index, step) in self.steps.iter_mut().enumerate() {
                     if !had_error {
-                        match (step.function)() {
+                        match (step.function)().await {
                             Ok(status) => {
                                 match status {
                                     TaskStepStatusOk::Success => step_log!(
@@ -433,8 +466,9 @@ where
                     self.status = Status::Executed
                 }
 
-                // Reduce the total executions (if set).
-                self.repeats = self.repeats.map(|r| r - 1);
+                // Reduce the total executions (if set). Saturate at zero so a task
+                // constructed with `repeat(0)` cannot underflow.
+                self.repeats = self.repeats.map(|r| r.saturating_sub(1));
 
                 Ok(())
             }
@@ -446,12 +480,8 @@ where
         match &self.status {
             Status::Init => Err(TaskError::NotInitialized),
             Status::Failed | Status::Executed => {
-                self.next_exec = Some(
-                    self.schedule
-                        .upcoming(self.timezone.clone())
-                        .next()
-                        .unwrap(),
-                );
+                // Determine the next status based on the remaining repeats first: if the
+                // task is done there is no need to compute a next execution time.
                 self.status = match self.repeats {
                     Some(t) => {
                         if t > 0 {
@@ -468,6 +498,20 @@ where
                     }
                     None => Status::Scheduled,
                 };
+                if self.status == Status::Scheduled {
+                    match self.schedule.upcoming(self.timezone.clone()).next() {
+                        Some(next) => self.next_exec = Some(next),
+                        None => {
+                            // No further executions available; retire the task.
+                            task_log!(
+                                self.task_id,
+                                log::Level::Warn,
+                                "Has no upcoming execution and will be removed"
+                            );
+                            self.status = Status::Finished;
+                        }
+                    }
+                }
                 Ok(())
             }
             Status::Finished | Status::ForceRemoved => {
@@ -504,6 +548,7 @@ where
 pub async fn run_task<T>(mut task: Task<T>)
 where
     T: TimeZone + Send + 'static,
+    <T as TimeZone>::Offset: Send,
 {
     while let Some(msg) = task
         .receiver
@@ -512,7 +557,7 @@ where
         .recv()
         .await
     {
-        task.execute_command(msg);
+        task.execute_command(msg).await;
     }
 }
 
@@ -523,19 +568,19 @@ mod test {
     use crate::task::TaskStepStatusOk::Success;
     use chrono::prelude::*;
 
-    #[test]
-    fn normal_task_flow_test() {
+    #[tokio::test]
+    async fn normal_task_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
-        task.add_step_default(|| Ok(Success));
+        task.add_step_default(|| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
@@ -546,43 +591,43 @@ mod test {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.set_schedule(schedule);
-        task.add_step_default(|| Ok(Success));
+        task.add_step_default(|| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
     }
 
-    #[test]
-    fn normal_task_error_flow_test() {
+    #[tokio::test]
+    async fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
-        task.add_step_default(|| Err(Error));
+        task.add_step_default(|| async { Err(Error) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Failed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Failed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
 
     /// Test the normal execution of a simple task, without fixed repeats.
-    #[test]
-    fn normal_task_no_fixed_repeats_test() {
+    #[tokio::test]
+    async fn normal_task_no_fixed_repeats_test() {
         let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local).unwrap();
-        task.add_step_default(|| Ok(Success));
+        task.add_step_default(|| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
         // Run it for a few times.
         for _i in 1..10 {
-            assert!(task.run_task().is_ok());
+            assert!(task.run_task().await.is_ok());
             assert_eq!(task.status, Status::Executed);
             assert!(task.reschedule().is_ok());
             assert_eq!(task.status, Status::Scheduled);
@@ -600,76 +645,82 @@ mod test {
         ));
     }
 
-    #[test]
-    fn test_reschedule_finished_should_mark_as_finished() {
+    #[tokio::test]
+    async fn test_reschedule_finished_should_mark_as_finished() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         // Execute the task.
         task.set_id(0);
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
 
-    #[test]
-    fn test_run_uninitialized_task() {
+    #[tokio::test]
+    async fn test_run_uninitialized_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        assert!(task.run_task().is_err());
+        assert!(task.run_task().await.is_err());
         assert!(matches!(
-            task.run_task().unwrap_err(),
+            task.run_task().await.unwrap_err(),
             TaskError::NotInitialized
         ));
     }
 
-    #[test]
-    fn test_run_failed_task() {
+    #[tokio::test]
+    async fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|| Err(Error));
+        task.add_step_default(|| async { Err(Error) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Failed);
         // Attempt to rerun it, it should fail.
-        assert!(task.run_task().is_err());
-        assert!(matches!(task.run_task().unwrap_err(), TaskError::Failed));
+        assert!(task.run_task().await.is_err());
+        assert!(matches!(
+            task.run_task().await.unwrap_err(),
+            TaskError::Failed
+        ));
     }
 
-    #[test]
-    fn test_run_executed_task() {
+    #[tokio::test]
+    async fn test_run_executed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step("Step 1", || Ok(Success));
+        task.add_step("Step 1", || async { Ok(Success) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Executed);
         // Attempt to run it again, it should fail.
-        assert!(task.run_task().is_err());
+        assert!(task.run_task().await.is_err());
         assert!(matches!(
-            task.run_task().unwrap_err(),
+            task.run_task().await.unwrap_err(),
             TaskError::AlreadyExecuted
         ));
     }
 
-    #[test]
-    fn test_run_finished_task() {
+    #[tokio::test]
+    async fn test_run_finished_task() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         task.set_id(0);
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
         // At this point the task is Finished. It should not be allowed to run again.
-        assert!(task.run_task().is_err());
-        assert!(matches!(task.run_task().unwrap_err(), TaskError::Finished));
+        assert!(task.run_task().await.is_err());
+        assert!(matches!(
+            task.run_task().await.unwrap_err(),
+            TaskError::Finished
+        ));
     }
 
-    #[test]
-    fn test_run_failed_delete() {
+    #[tokio::test]
+    async fn test_run_failed_delete() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|| Err(ErrorDelete));
+        task.add_step_default(|| async { Err(ErrorDelete) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::ForceRemoved);
     }
 
@@ -683,8 +734,8 @@ mod test {
         ));
     }
 
-    #[test]
-    fn test_task_status_transitions() {
+    #[tokio::test]
+    async fn test_task_status_transitions() {
         let mut task = Task::new(
             "* * * * * * *",
             Some("Status transition test"),
@@ -701,10 +752,10 @@ mod test {
         assert_eq!(task.status, Status::Scheduled);
 
         // Add a step that succeeds
-        task.add_step_default(|| Ok(TaskStepStatusOk::Success));
+        task.add_step_default(|| async { Ok(TaskStepStatusOk::Success) });
 
         // After run_task(), status should be Executed
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
         assert_eq!(task.status, Status::Executed);
 
         // After reschedule(), with repeats=1 and already executed once,
@@ -716,15 +767,15 @@ mod test {
     #[test]
     fn test_task_step_display() {
         // Test with description
-        let step_with_desc = TaskStep::new("Test step", || Ok(TaskStepStatusOk::Success));
+        let step_with_desc = TaskStep::new("Test step", || async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_with_desc), "Test step");
 
         // Test without description
-        let step_no_desc = TaskStep::default(|| Ok(TaskStepStatusOk::Success));
+        let step_no_desc = TaskStep::default(|| async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_no_desc), "-");
 
         // Test with empty description
-        let step_empty_desc = TaskStep::new("", || Ok(TaskStepStatusOk::Success));
+        let step_empty_desc = TaskStep::new("", || async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_empty_desc), "-");
     }
 
@@ -737,11 +788,12 @@ mod test {
         task.set_id(1);
 
         // Add a simple step to ensure the Run command works properly
-        task.add_step("Test step", || Ok(TaskStepStatusOk::Success));
+        task.add_step("Test step", || async { Ok(TaskStepStatusOk::Success) });
 
         // Test Init command first - this should initialize the task
         let (tx_init, rx_init) = oneshot::channel();
-        task.execute_command(TaskCmd::Init { sender: tx_init });
+        task.execute_command(TaskCmd::Init { sender: tx_init })
+            .await;
         let init_response = rx_init.await.unwrap();
         assert_eq!(init_response.id, 1);
         assert_eq!(init_response.status, Status::Scheduled);
@@ -754,7 +806,8 @@ mod test {
         let (tx_run_no_exec, rx_run_no_exec) = oneshot::channel();
         task.execute_command(TaskCmd::Run {
             sender: tx_run_no_exec,
-        });
+        })
+        .await;
         let no_exec_response = rx_run_no_exec.await.unwrap();
         assert_eq!(no_exec_response.id, 1);
         assert_eq!(
@@ -769,7 +822,7 @@ mod test {
 
         // Send Run command - this should execute the task
         let (tx_run, rx_run) = oneshot::channel();
-        task.execute_command(TaskCmd::Run { sender: tx_run });
+        task.execute_command(TaskCmd::Run { sender: tx_run }).await;
         let run_response = rx_run.await.unwrap();
         assert_eq!(run_response.id, 1);
         assert_eq!(run_response.status, Status::Executed);
@@ -778,14 +831,15 @@ mod test {
         let (tx_reschedule, rx_reschedule) = oneshot::channel();
         task.execute_command(TaskCmd::Reschedule {
             sender: tx_reschedule,
-        });
+        })
+        .await;
         let reschedule_response = rx_reschedule.await.unwrap();
         assert_eq!(reschedule_response.id, 1);
         assert_eq!(reschedule_response.status, Status::Finished);
     }
 
-    #[test]
-    fn test_task_multiple_steps_execution() {
+    #[tokio::test]
+    async fn test_task_multiple_steps_execution() {
         use std::sync::{Arc, Mutex};
 
         // Create counters to track step execution
@@ -799,25 +853,34 @@ mod test {
         // Add steps that increment counters
         let c1 = counter1.clone();
         task.add_step("Step 1", move || {
-            *c1.lock().unwrap() += 1;
-            Ok(TaskStepStatusOk::Success)
+            let c1 = c1.clone();
+            async move {
+                *c1.lock().unwrap() += 1;
+                Ok(TaskStepStatusOk::Success)
+            }
         });
 
         let c2 = counter2.clone();
         task.add_step("Step 2", move || {
-            *c2.lock().unwrap() += 1;
-            Ok(TaskStepStatusOk::Success)
+            let c2 = c2.clone();
+            async move {
+                *c2.lock().unwrap() += 1;
+                Ok(TaskStepStatusOk::Success)
+            }
         });
 
         let c3 = counter3.clone();
         task.add_step("Step 3", move || {
-            *c3.lock().unwrap() += 1;
-            Ok(TaskStepStatusOk::Success)
+            let c3 = c3.clone();
+            async move {
+                *c3.lock().unwrap() += 1;
+                Ok(TaskStepStatusOk::Success)
+            }
         });
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
 
         // Verify all steps executed
         assert_eq!(*counter1.lock().unwrap(), 1);
@@ -828,8 +891,8 @@ mod test {
         assert_eq!(task.status, Status::Executed);
     }
 
-    #[test]
-    fn test_task_step_failure_scenarios() {
+    #[tokio::test]
+    async fn test_task_step_failure_scenarios() {
         use std::sync::{Arc, Mutex};
 
         // Create a counter to verify which steps executed
@@ -841,27 +904,36 @@ mod test {
         // First step succeeds
         let counter = execution_counter.clone();
         task.add_step("Step 1", move || {
-            counter.lock().unwrap().push(1);
-            Ok(TaskStepStatusOk::Success)
+            let counter = counter.clone();
+            async move {
+                counter.lock().unwrap().push(1);
+                Ok(TaskStepStatusOk::Success)
+            }
         });
 
         // Second step fails
         let counter = execution_counter.clone();
         task.add_step("Step 2", move || {
-            counter.lock().unwrap().push(2);
-            Err(TaskStepStatusErr::Error)
+            let counter = counter.clone();
+            async move {
+                counter.lock().unwrap().push(2);
+                Err(TaskStepStatusErr::Error)
+            }
         });
 
         // Third step should not execute due to previous failure
         let counter = execution_counter.clone();
         task.add_step("Step 3", move || {
-            counter.lock().unwrap().push(3);
-            Ok(TaskStepStatusOk::Success)
+            let counter = counter.clone();
+            async move {
+                counter.lock().unwrap().push(3);
+                Ok(TaskStepStatusOk::Success)
+            }
         });
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
 
         // Verify only steps 1 and 2 executed
         assert_eq!(*execution_counter.lock().unwrap(), vec![1, 2]);
@@ -870,15 +942,17 @@ mod test {
         assert_eq!(task.status, Status::Failed);
     }
 
-    #[test]
-    fn test_force_removal() {
+    #[tokio::test]
+    async fn test_force_removal() {
         // Create a task with a step that forces removal
         let mut task = Task::new("* * * * * * *", Some("Force removal"), None, Local).unwrap();
-        task.add_step("Failing step", || Err(TaskStepStatusErr::ErrorDelete));
+        task.add_step("Failing step", || async {
+            Err(TaskStepStatusErr::ErrorDelete)
+        });
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
 
         // Verify task is marked for force removal
         assert_eq!(task.status, Status::ForceRemoved);
@@ -888,16 +962,56 @@ mod test {
         assert_eq!(task.status, Status::ForceRemoved);
     }
 
-    #[test]
-    fn test_empty_task_execution() {
+    #[tokio::test]
+    async fn test_empty_task_execution() {
         // Create a task with no steps
         let mut task = Task::new("* * * * * * *", Some("Empty task"), None, Local).unwrap();
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().is_ok());
+        assert!(task.run_task().await.is_ok());
 
         // Verify task is marked as Executed even with no steps
         assert_eq!(task.status, Status::Executed);
+    }
+
+    /// A step that actually awaits should be driven to completion by `run_task`.
+    #[tokio::test]
+    async fn test_async_step_is_awaited() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+
+        let mut task = Task::new("* * * * * * *", Some("Async step"), Some(1), Utc).unwrap();
+        task.add_step("Awaits", move || {
+            let flag = flag.clone();
+            async move {
+                // Yield to the runtime to prove the future is actually polled/awaited.
+                tokio::task::yield_now().await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(TaskStepStatusOk::Success)
+            }
+        });
+
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert!(ran.load(Ordering::SeqCst), "async step body must run");
+        assert_eq!(task.status, Status::Executed);
+    }
+
+    /// A task built with `repeat(0)` must not underflow when executed (B6 regression).
+    #[tokio::test]
+    async fn test_repeat_zero_does_not_underflow() {
+        let mut task = Task::new("* * * * * * *", Some("Zero repeats"), Some(0), Utc).unwrap();
+        task.add_step_default(|| async { Ok(Success) });
+        task.init();
+        // Would panic with an integer underflow before the `saturating_sub` fix.
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.repeats, Some(0));
+        // With no repeats left, the task is retired on reschedule.
+        assert!(task.reschedule().is_ok());
+        assert_eq!(task.status, Status::Finished);
     }
 }
