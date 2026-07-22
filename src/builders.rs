@@ -1,7 +1,12 @@
 use crate::errors::{TaskError, TaskResult};
-use crate::task::{Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk};
+use crate::retry::RetryPolicy;
+use crate::task::{
+    boxed_callback, CallbackFn, Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk,
+};
 use chrono::TimeZone;
 use cron::Schedule;
+use std::future::Future;
+use std::time::Duration;
 
 /// Task builder function.
 ///
@@ -21,6 +26,16 @@ where
     expression: String,
     /// Max number of repeats.
     repeats: Option<usize>,
+    /// (Optional) per-step execution timeout.
+    timeout: Option<Duration>,
+    /// (Optional) retry policy for failing steps.
+    retry_policy: Option<RetryPolicy>,
+    /// (Optional) callback invoked after a successful execution.
+    on_success: Option<Box<CallbackFn>>,
+    /// (Optional) callback invoked after a failed execution.
+    on_failure: Option<Box<CallbackFn>>,
+    /// (Optional) callback invoked once the task reaches a terminal state.
+    on_finish: Option<Box<CallbackFn>>,
     /// The Task/Scheduler timezone.
     timezone: T,
 }
@@ -48,6 +63,11 @@ where
             schedule: None,
             expression: "* * * * * * *".to_string(), // Default expression
             repeats: None,
+            timeout: None,
+            retry_policy: None,
+            on_success: None,
+            on_failure: None,
+            on_finish: None,
             timezone,
         }
     }
@@ -107,6 +127,133 @@ where
     /// ```
     pub fn repeat(mut self, repeat: usize) -> TaskBuilder<T> {
         self.repeats = Some(repeat);
+        self
+    }
+
+    /// Set a per-step execution timeout for the generated `Task`.
+    ///
+    /// A step whose future does not resolve within `timeout` is cancelled and
+    /// treated as a (retryable) failure.
+    ///
+    /// # Arguments
+    ///
+    /// * timeout   - The maximum duration allowed for a single step attempt.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::time::Duration;
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .timeout(Duration::from_secs(5))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn timeout(mut self, timeout: Duration) -> TaskBuilder<T> {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set the retry policy applied to failing steps of the generated `Task`.
+    ///
+    /// Only steps returning [`TaskStepStatusErr::Error`] (or timing out) are retried;
+    /// [`TaskStepStatusErr::ErrorDelete`] bypasses retries.
+    ///
+    /// # Arguments
+    ///
+    /// * policy    - The [`RetryPolicy`] to apply.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::time::Duration;
+    /// # use tasklet::{RetryPolicy, TaskBuilder};
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .retry(RetryPolicy::fixed(3, Duration::from_millis(100)))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn retry(mut self, policy: RetryPolicy) -> TaskBuilder<T> {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Register a callback invoked after each successful execution of the task.
+    ///
+    /// # Arguments
+    ///
+    /// * callback  - An async closure invoked when a run completes successfully.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .on_success(|| async { println!("task succeeded"); })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn on_success<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
+    where
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_success = Some(boxed_callback(callback));
+        self
+    }
+
+    /// Register a callback invoked after a failed execution of the task.
+    ///
+    /// # Arguments
+    ///
+    /// * callback  - An async closure invoked when a run fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .on_failure(|| async { eprintln!("task failed"); })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn on_failure<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
+    where
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_failure = Some(boxed_callback(callback));
+        self
+    }
+
+    /// Register a callback invoked once when the task reaches a terminal state
+    /// (its repeat cycle is exhausted or it is force-removed).
+    ///
+    /// # Arguments
+    ///
+    /// * callback  - An async closure invoked when the task finishes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .repeat(1)
+    ///     .on_finish(|| async { println!("task finished"); })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn on_finish<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
+    where
+        F: (FnMut() -> Fut) + 'static + Send,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_finish = Some(boxed_callback(callback));
         self
     }
 
@@ -193,6 +340,17 @@ where
 
         // Set the steps
         task.set_steps(self.steps);
+
+        // Transfer the optional timeout / retry configuration.
+        if let Some(timeout) = self.timeout {
+            task.set_timeout(timeout);
+        }
+        if let Some(policy) = self.retry_policy {
+            task.set_retry_policy(policy);
+        }
+
+        // Transfer the lifecycle callbacks.
+        task.set_callbacks(self.on_success, self.on_failure, self.on_finish);
 
         Ok(task)
     }

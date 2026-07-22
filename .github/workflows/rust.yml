@@ -2,7 +2,7 @@ name: Rust Build and Test
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main, dev, 'v*' ]
   pull_request:
     branches: [ main, dev ]
 
@@ -16,13 +16,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Update Rust
         run: rustup update stable
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose --all-targets
 
       - name: Run tests
         run: cargo test --verbose
@@ -35,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Update rust
         run: rustup update stable
@@ -53,7 +59,7 @@ jobs:
           cargo tarpaulin --verbose --all-features --workspace --timeout 120 --run-types Tests --run-types Doctests --out Xml
 
       - name: Coverage upload
-        uses: codecov/codecov-action@v1
+        uses: codecov/codecov-action@v4
         with:
           token: ${{secrets.CODECOV_TOKEN}}
           fail_ci_if_error: true

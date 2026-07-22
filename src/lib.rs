@@ -8,9 +8,13 @@
 //!
 //! * **Async steps** — every task step is a closure returning a future, so steps can
 //!   `.await` real asynchronous work (I/O, timers, ...) without blocking the runtime.
-//! * **Graceful shutdown** — obtain a [`scheduler::SchedulerHandle`] via
+//! * **Graceful shutdown** — obtain a [`SchedulerHandle`] via
 //!   [`TaskScheduler::handle`] before running and call `shutdown()` to stop the scheduler
 //!   cleanly, or drive shutdown with any future via [`TaskScheduler::run_until`].
+//! * **Resilience** — configure a per-step [`TaskBuilder::timeout`], a
+//!   [`RetryPolicy`] via [`TaskBuilder::retry`], and async lifecycle
+//!   callbacks ([`TaskBuilder::on_success`] / [`on_failure`](TaskBuilder::on_failure) /
+//!   [`on_finish`](TaskBuilder::on_finish)).
 //!
 //! # Example
 //!
@@ -35,13 +39,15 @@
 mod builders;
 pub mod errors;
 mod generator;
+pub mod retry;
 mod scheduler;
 pub mod task;
 
 pub use builders::TaskBuilder;
 pub use errors::{TaskError, TaskResult};
 pub use generator::TaskGenerator;
-pub use scheduler::TaskScheduler;
+pub use retry::{Backoff, RetryPolicy};
+pub use scheduler::{SchedulerHandle, TaskScheduler};
 pub use task::Task;
 
 /// Macro for consistent task-related logging

@@ -1,0 +1,99 @@
+name: Release (publish to crates.io)
+
+# Runs when a pull request is merged into main (i.e. a push lands on main).
+# It only publishes when the version in Cargo.toml is one that does not yet exist
+# on crates.io, so ordinary merges that don't bump the version are a no-op.
+on:
+  push:
+    branches: [ main ]
+
+# Never let two publish runs overlap.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Cheap gate: work out the crate version and whether it is already published.
+  # Ordinary merges stop here without spinning up the full build.
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read crate name and version
+        id: meta
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Crate: $name, version: $version"
+
+      - name: Check whether the version is already on crates.io
+        id: check
+        run: |
+          name='${{ steps.meta.outputs.name }}'
+          version='${{ steps.meta.outputs.version }}'
+          # Build the crate's sparse-index path (same scheme crates.io uses).
+          lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+          len=${#lower}
+          if   [ "$len" -eq 1 ]; then path="1/$lower";
+          elif [ "$len" -eq 2 ]; then path="2/$lower";
+          elif [ "$len" -eq 3 ]; then path="3/${lower:0:1}/$lower";
+          else path="${lower:0:2}/${lower:2:2}/$lower"; fi
+          url="https://index.crates.io/$path"
+          echo "Index URL: $url"
+          # `|| true` so a 404 (crate/version not found) does not fail the step.
+          body=$(curl -sSL "$url" || true)
+          if printf '%s' "$body" | grep -qF "\"vers\":\"$version\""; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Version $version is already published, nothing to do."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Version $version is new, it will be published."
+          fi
+
+  # Full gate + publish. Only runs when `check` decided the version is new.
+  publish:
+    name: Build and publish
+    needs: check
+    if: needs.check.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Rust
+        run: rustup update stable
+
+      # Quality gate: never publish something that would not pass CI.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose --all-targets
+
+      - name: Test
+        run: cargo test --verbose
+
+      - name: Doc tests
+        run: cargo test --doc --verbose
+
+      - name: Dry-run package
+        run: cargo publish --dry-run
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
