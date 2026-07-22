@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/github/license/stav121/tasklet?style=for-the-badge&color=lightgrey&logo=amazoniam&logoColor=white)](https://github.com/stav121/tasklet/blob/main/LICENSE)
 [![GitHub issues](https://img.shields.io/github/issues/stav121/tasklet?style=for-the-badge&color=yellow&logo=github)](https://github.com/stav121/tasklet/issues)
 
-⏱️ An asynchronous task scheduling library written in Rust
+An asynchronous task scheduling library written in Rust
 
 ## About
 
@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.3.0"
+tasklet = "0.3.1"
 ```
 
 > **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
@@ -125,6 +125,41 @@ scheduler.run().await; // returns once shutdown is requested
 
 You can also drive the shutdown with any future via `scheduler.run_until(future)` — for
 example a timer or an OS signal.
+
+## Timeouts, retries and lifecycle callbacks
+
+Tasks can be made resilient with a few optional builder settings (all non-breaking,
+added in 0.3.1):
+
+```rust,no_run
+use std::time::Duration;
+use tasklet::task::TaskStepStatusOk::Success;
+use tasklet::{RetryPolicy, TaskBuilder};
+
+let _task = TaskBuilder::new(chrono::Local)
+    .every("1 * * * * * *")
+    // Cancel any single step attempt that runs longer than this.
+    .timeout(Duration::from_secs(5))
+    // Retry failing steps with exponential backoff (100ms, 200ms, 400ms), capped at 2s.
+    .retry(RetryPolicy::exponential(3, Duration::from_millis(100), 2)
+        .with_max_delay(Duration::from_secs(2)))
+    // Async lifecycle hooks.
+    .on_success(|| async { println!("run succeeded"); })
+    .on_failure(|| async { eprintln!("run failed"); })
+    .on_finish(|| async { println!("task finished its lifecycle"); })
+    .add_step("Step", || async { Ok(Success) })
+    .build();
+```
+
+- **Timeout** (`.timeout`) bounds each individual step attempt; a step that exceeds it is
+  cancelled and treated as a (retryable) failure.
+- **Retry** (`.retry`) re-attempts a step that returns `TaskStepStatusErr::Error` (or times
+  out). Use `RetryPolicy::fixed` or `RetryPolicy::exponential`. A step returning
+  `TaskStepStatusErr::ErrorDelete` bypasses retries and removes the task immediately.
+- **Callbacks** (`.on_success` / `.on_failure` / `.on_finish`) are async hooks;
+  `on_finish` fires once when the task reaches a terminal state.
+
+See [`examples/retry_timeout_example.rs`](/examples/retry_timeout_example.rs) for a runnable demo.
 
 ## Migrating from 0.2.x to 0.3.0
 

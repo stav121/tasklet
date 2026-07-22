@@ -2,6 +2,7 @@ extern crate chrono;
 extern crate cron;
 
 use crate::errors::{TaskError, TaskResult};
+use crate::retry::RetryPolicy;
 use crate::{step_log, task_log};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use cron::Schedule;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// Possible success status values for a step's execution.
@@ -40,6 +42,23 @@ pub type StepFuture =
 ///
 /// Each call produces a fresh [`StepFuture`] to be awaited.
 pub type ExecutableFn = dyn FnMut() -> StepFuture + 'static + Send;
+
+/// The boxed future produced by a lifecycle callback when it is invoked.
+pub type CallbackFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// An asynchronous lifecycle callback (on-success / on-failure / on-finish).
+///
+/// Each call produces a fresh [`CallbackFuture`] to be awaited by the scheduler.
+pub type CallbackFn = dyn FnMut() -> CallbackFuture + 'static + Send;
+
+/// Box an async closure into a [`CallbackFn`].
+pub(crate) fn boxed_callback<F, Fut>(mut callback: F) -> Box<CallbackFn>
+where
+    F: (FnMut() -> Fut) + 'static + Send,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Box::new(move || Box::pin(callback()))
+}
 
 /// A task step.
 ///
@@ -177,6 +196,17 @@ where
     pub(crate) status: Status,
     /// Task receiver
     pub(crate) receiver: Option<mpsc::Receiver<TaskCmd>>,
+    /// (Optional) per-step execution timeout. A step exceeding it is cancelled and
+    /// treated as a (retryable) failure.
+    pub(crate) timeout: Option<Duration>,
+    /// (Optional) retry policy applied to failing steps.
+    pub(crate) retry_policy: Option<RetryPolicy>,
+    /// (Optional) callback invoked after a successful execution.
+    pub(crate) on_success: Option<Box<CallbackFn>>,
+    /// (Optional) callback invoked after a failed execution.
+    pub(crate) on_failure: Option<Box<CallbackFn>>,
+    /// (Optional) callback invoked once when the task reaches a terminal state.
+    pub(crate) on_finish: Option<Box<CallbackFn>>,
 }
 
 impl<T> Debug for Task<T>
@@ -190,6 +220,8 @@ where
             .field("status", &self.status)
             .field("repeats", &self.repeats)
             .field("next_exec", &self.next_exec)
+            .field("timeout", &self.timeout)
+            .field("retry_policy", &self.retry_policy)
             .finish()
     }
 }
@@ -243,6 +275,11 @@ where
             status: Status::default(),
             next_exec: None,
             receiver: None,
+            timeout: None,
+            retry_policy: None,
+            on_success: None,
+            on_failure: None,
+            on_finish: None,
         })
     }
 
@@ -321,6 +358,38 @@ where
         self
     }
 
+    /// Set the per-step execution timeout.
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) -> &mut Task<T> {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set the retry policy for failing steps.
+    pub(crate) fn set_retry_policy(&mut self, policy: RetryPolicy) -> &mut Task<T> {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the callbacks invoked over the task's lifecycle.
+    pub(crate) fn set_callbacks(
+        &mut self,
+        on_success: Option<Box<CallbackFn>>,
+        on_failure: Option<Box<CallbackFn>>,
+        on_finish: Option<Box<CallbackFn>>,
+    ) -> &mut Task<T> {
+        self.on_success = on_success;
+        self.on_failure = on_failure;
+        self.on_finish = on_finish;
+        self
+    }
+
+    /// Invoke a lifecycle callback if it is set.
+    async fn fire_callback(callback: &mut Option<Box<CallbackFn>>) {
+        if let Some(callback) = callback.as_mut() {
+            callback().await;
+        }
+    }
+
     /// Initialize the `Task` instance and schedule the first execution.
     ///
     /// # Arguments
@@ -378,11 +447,29 @@ where
                 };
                 if due {
                     let _ = self.run_task().await; // Ignore the result as we already update the status
+                                                   // Fire the relevant lifecycle callbacks based on the outcome.
+                                                   // `on_finish` for a force-removed task is fired here since that
+                                                   // is its terminal state; a normally-finishing task fires it in
+                                                   // the reschedule branch below.
+                    match self.status {
+                        Status::Executed => Self::fire_callback(&mut self.on_success).await,
+                        Status::Failed => Self::fire_callback(&mut self.on_failure).await,
+                        Status::ForceRemoved => {
+                            Self::fire_callback(&mut self.on_failure).await;
+                            Self::fire_callback(&mut self.on_finish).await;
+                        }
+                        _ => {}
+                    }
                 }
                 let _ = sender.send(self.get_task_response());
             }
             TaskCmd::Reschedule { sender } => {
                 let _ = self.reschedule(); // Ignore the result as we already update the status
+                                           // A task that has just reached the `Finished` state fires `on_finish`
+                                           // exactly once (force-removed tasks already fired it in the Run branch).
+                if self.status == Status::Finished {
+                    Self::fire_callback(&mut self.on_finish).await;
+                }
                 let _ = sender.send(self.get_task_response());
             }
             TaskCmd::Init { sender } => {
@@ -409,10 +496,47 @@ where
                     "Executing '{}'",
                     self.description
                 );
+                // Snapshot the timeout / retry configuration before borrowing
+                // `self.steps` mutably below.
+                let timeout = self.timeout;
+                let retry = self.retry_policy.clone();
+                let max_attempts = 1 + retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
+
                 let mut had_error: bool = false;
                 for (index, step) in self.steps.iter_mut().enumerate() {
-                    if !had_error {
-                        match (step.function)().await {
+                    if had_error {
+                        break;
+                    }
+                    // Attempt the step, retrying transient (`Error`) failures and
+                    // timeouts according to the retry policy. `ErrorDelete` and
+                    // success both terminate the attempt loop immediately.
+                    let mut attempt: u32 = 0;
+                    loop {
+                        attempt += 1;
+
+                        // Run the step, optionally bounded by the configured timeout.
+                        // A timeout is treated as a (retryable) `Error`.
+                        let result = match timeout {
+                            Some(duration) => {
+                                match tokio::time::timeout(duration, (step.function)()).await {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        step_log!(
+                                            self.task_id,
+                                            index,
+                                            log::Level::Warn,
+                                            "Timed out after {:?} - {}",
+                                            duration,
+                                            step
+                                        );
+                                        Err(TaskStepStatusErr::Error)
+                                    }
+                                }
+                            }
+                            None => (step.function)().await,
+                        };
+
+                        match result {
                             Ok(status) => {
                                 match status {
                                     TaskStepStatusOk::Success => step_log!(
@@ -430,35 +554,53 @@ where
                                         step
                                     ),
                                 }
-                                self.status = Status::Executed
+                                self.status = Status::Executed;
+                                break;
                             }
-                            Err(status) => {
-                                // Indicate that there was an error.
+                            Err(TaskStepStatusErr::ErrorDelete) => {
+                                step_log!(
+                                    self.task_id,
+                                    index,
+                                    log::Level::Error,
+                                    "Execution failed and task is marked for deletion - {}",
+                                    step
+                                );
+                                self.status = Status::ForceRemoved;
                                 had_error = true;
-                                match status {
-                                    TaskStepStatusErr::Error => {
-                                        step_log!(
-                                            self.task_id,
-                                            index,
-                                            log::Level::Error,
-                                            "Execution failed - {}",
-                                            step
-                                        );
-                                        self.status = Status::Failed
-                                    }
-                                    TaskStepStatusErr::ErrorDelete => {
-                                        step_log!(
-                                            self.task_id,
-                                            index,
-                                            log::Level::Error,
-                                            "Execution failed and task is marked for deletion - {}",
-                                            step
-                                        );
-                                        self.status = Status::ForceRemoved
-                                    }
-                                }
+                                break;
                             }
-                        };
+                            Err(TaskStepStatusErr::Error) => {
+                                if (attempt as usize) < max_attempts {
+                                    // `retry` is guaranteed `Some` here: `max_attempts > 1`
+                                    // only when a retry policy is set.
+                                    let delay = retry.as_ref().unwrap().delay(attempt - 1);
+                                    step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Warn,
+                                        "Execution failed, retrying (attempt {}/{}) after {:?} - {}",
+                                        attempt,
+                                        max_attempts,
+                                        delay,
+                                        step
+                                    );
+                                    if !delay.is_zero() {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    continue;
+                                }
+                                step_log!(
+                                    self.task_id,
+                                    index,
+                                    log::Level::Error,
+                                    "Execution failed - {}",
+                                    step
+                                );
+                                self.status = Status::Failed;
+                                had_error = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 // Avoid underflow in case of a task without steps.
@@ -1013,5 +1155,224 @@ mod test {
         // With no repeats left, the task is retired on reschedule.
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
+    }
+
+    /// A step exceeding the configured timeout is cancelled and marks the task failed. (C1)
+    #[tokio::test(start_paused = true)]
+    async fn test_step_timeout_marks_failed() {
+        let mut task = Task::new("* * * * * * *", Some("Timeout"), None, Utc).unwrap();
+        task.timeout = Some(Duration::from_millis(50));
+        task.add_step_default(|| async {
+            // Sleeps far longer than the timeout; the paused clock auto-advances so
+            // the timeout fires without a real wall-clock wait.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(Success)
+        });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.status, Status::Failed);
+    }
+
+    /// A transient failure is retried and the task succeeds once a step returns Ok. (C2)
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_eventually_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let mut task = Task::new("* * * * * * *", Some("Retry ok"), None, Utc).unwrap();
+        task.retry_policy = Some(RetryPolicy::fixed(3, Duration::from_millis(10)));
+        task.add_step_default(move || {
+            let c = c.clone();
+            async move {
+                // Fail the first two attempts, succeed on the third.
+                if c.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(Error)
+                } else {
+                    Ok(Success)
+                }
+            }
+        });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.status, Status::Executed);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// When the retry budget is exhausted the task is marked failed. (C2)
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_exhausted_marks_failed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let mut task = Task::new("* * * * * * *", Some("Retry fail"), None, Utc).unwrap();
+        task.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_millis(10)));
+        task.add_step_default(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(Error)
+            }
+        });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.status, Status::Failed);
+        // 1 initial attempt + 2 retries.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// `ErrorDelete` bypasses the retry policy and removes the task immediately. (C2)
+    #[tokio::test(start_paused = true)]
+    async fn test_error_delete_bypasses_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let mut task = Task::new("* * * * * * *", Some("Delete"), None, Utc).unwrap();
+        task.retry_policy = Some(RetryPolicy::fixed(5, Duration::from_millis(10)));
+        task.add_step_default(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(ErrorDelete)
+            }
+        });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.status, Status::ForceRemoved);
+        // Called exactly once — no retries.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A timed-out attempt counts as a retryable failure; a later attempt can succeed. (C1 + C2)
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let mut task = Task::new("* * * * * * *", Some("Timeout retry"), None, Utc).unwrap();
+        task.timeout = Some(Duration::from_millis(50));
+        task.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_millis(0)));
+        task.add_step_default(move || {
+            let c = c.clone();
+            async move {
+                // First attempt hangs past the timeout; subsequent attempts return quickly.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Ok(Success)
+            }
+        });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.status, Status::Executed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Lifecycle callbacks fire for a successful, finishing task. (C6)
+    #[tokio::test]
+    async fn test_lifecycle_callbacks_success_and_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let success = Arc::new(AtomicUsize::new(0));
+        let failure = Arc::new(AtomicUsize::new(0));
+        let finish = Arc::new(AtomicUsize::new(0));
+
+        let mut task = Task::new("* * * * * * *", Some("Callbacks"), Some(1), Utc).unwrap();
+        task.add_step_default(|| async { Ok(Success) });
+
+        let s = success.clone();
+        task.on_success = Some(boxed_callback(move || {
+            let s = s.clone();
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let f = failure.clone();
+        task.on_failure = Some(boxed_callback(move || {
+            let f = f.clone();
+            async move {
+                f.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let fin = finish.clone();
+        task.on_finish = Some(boxed_callback(move || {
+            let fin = fin.clone();
+            async move {
+                fin.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        task.set_id(0);
+        task.init();
+        // Force the task to be due.
+        task.next_exec = Some(Utc::now() - chrono::Duration::seconds(1));
+
+        // Run: fires on_success.
+        let (tx, rx) = oneshot::channel();
+        task.execute_command(TaskCmd::Run { sender: tx }).await;
+        let _ = rx.await.unwrap();
+
+        // Reschedule: repeats exhausted, so the task finishes and fires on_finish.
+        let (tx, rx) = oneshot::channel();
+        task.execute_command(TaskCmd::Reschedule { sender: tx })
+            .await;
+        let _ = rx.await.unwrap();
+
+        assert_eq!(success.load(Ordering::SeqCst), 1);
+        assert_eq!(failure.load(Ordering::SeqCst), 0);
+        assert_eq!(finish.load(Ordering::SeqCst), 1);
+    }
+
+    /// A force-removed task fires both on_failure and on_finish. (C6)
+    #[tokio::test]
+    async fn test_lifecycle_callbacks_force_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let failure = Arc::new(AtomicUsize::new(0));
+        let finish = Arc::new(AtomicUsize::new(0));
+
+        let mut task = Task::new("* * * * * * *", Some("Callbacks delete"), None, Utc).unwrap();
+        task.add_step_default(|| async { Err(ErrorDelete) });
+
+        let f = failure.clone();
+        task.on_failure = Some(boxed_callback(move || {
+            let f = f.clone();
+            async move {
+                f.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let fin = finish.clone();
+        task.on_finish = Some(boxed_callback(move || {
+            let fin = fin.clone();
+            async move {
+                fin.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        task.set_id(0);
+        task.init();
+        task.next_exec = Some(Utc::now() - chrono::Duration::seconds(1));
+
+        let (tx, rx) = oneshot::channel();
+        task.execute_command(TaskCmd::Run { sender: tx }).await;
+        let _ = rx.await.unwrap();
+
+        assert_eq!(failure.load(Ordering::SeqCst), 1);
+        assert_eq!(finish.load(Ordering::SeqCst), 1);
     }
 }

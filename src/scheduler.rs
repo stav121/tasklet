@@ -296,7 +296,7 @@ where
                         task_log!(
                             res.id,
                             log::Level::Debug,
-                            "Killing task due to {}",
+                            "Removing task due to {}",
                             if res.status == Status::Finished {
                                 "end of execution cycle"
                             } else {
@@ -358,7 +358,7 @@ where
                 Err(_) => {
                     scheduler_log!(
                         log::Level::Error,
-                        "RecvError returned by at least one uninitialized task"
+                        "A task failed to report its init status and will be skipped"
                     );
                 }
             });
@@ -477,7 +477,7 @@ where
     {
         scheduler_log!(
             log::Level::Info,
-            "Scheduler started. Total tasks in queue: {}",
+            "Scheduler started with {} task(s) in queue",
             self.handles.len()
         );
 
@@ -486,16 +486,28 @@ where
         // Initialize the tasks
         self.init_tasks().await;
 
+        // Drive the loop with an `Interval` rather than sleeping for a fixed amount
+        // *after* each round. `sleep` would add the duration of `tick()` to every
+        // cycle, so the poll cadence would slowly drift and long rounds could push
+        // ticks past their intended time. An interval anchors ticks to a fixed
+        // wall-clock cadence; `Skip` collapses missed ticks (when a round overruns
+        // the period) instead of firing a burst of catch-up ticks. (B7)
+        let mut interval = tokio::time::interval(Duration::from_millis(self.sleep as u64));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            self.tick().await;
-            // Sleep between rounds, but wake up early if a shutdown is requested.
+            // Wake up on either a due tick or a shutdown request, whichever comes
+            // first. The first `interval.tick()` resolves immediately, so the first
+            // round runs without delay.
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
                     scheduler_log!(log::Level::Info, "Shutdown requested, stopping scheduler");
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(self.sleep as u64)) => {}
+                _ = interval.tick() => {
+                    self.tick().await;
+                }
             }
         }
 
