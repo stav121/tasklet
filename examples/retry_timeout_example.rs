@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tasklet::task::TaskStepStatusErr::Error;
 use tasklet::task::TaskStepStatusOk::Success;
-use tasklet::{RetryPolicy, TaskBuilder, TaskScheduler};
+use tasklet::{Jitter, RetryPolicy, TaskBuilder, TaskScheduler};
 
-/// Showcase of the resilience features added in 0.3.1:
+/// Showcase of the resilience features:
 ///
 /// * `.timeout(..)`  — bounds each individual step attempt.
-/// * `.retry(..)`    — re-attempts failing steps with a backoff policy.
+/// * `.retry(..)`    — re-attempts failing steps with a backoff policy and jitter.
 /// * `.on_success` / `.on_failure` / `.on_finish` — async lifecycle callbacks.
 ///
 /// The task runs a single time (`repeat(1)`). Its step fails on the first two
@@ -35,10 +35,12 @@ async fn main() {
             // Cancel any single attempt that runs longer than 2 seconds.
             .timeout(Duration::from_secs(2))
             // Retry up to 3 times with exponential backoff (100ms, 200ms, 400ms),
-            // capped at 1 second.
+            // capped at 1 second, with full jitter so many failing tasks don't all
+            // retry at the same instant.
             .retry(
                 RetryPolicy::exponential(3, Duration::from_millis(100), 2)
-                    .with_max_delay(Duration::from_secs(1)),
+                    .with_max_delay(Duration::from_secs(1))
+                    .with_jitter(Jitter::Full),
             )
             // Async lifecycle callbacks.
             .on_success(|| async { info!("run succeeded") })

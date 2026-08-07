@@ -12,9 +12,14 @@
 //!   [`TaskScheduler::handle`] before running and call `shutdown()` to stop the scheduler
 //!   cleanly, or drive shutdown with any future via [`TaskScheduler::run_until`].
 //! * **Resilience** — configure a per-step [`TaskBuilder::timeout`], a
-//!   [`RetryPolicy`] via [`TaskBuilder::retry`], and async lifecycle
-//!   callbacks ([`TaskBuilder::on_success`] / [`on_failure`](TaskBuilder::on_failure) /
-//!   [`on_finish`](TaskBuilder::on_finish)).
+//!   [`RetryPolicy`] (with optional [`Jitter`]) via [`TaskBuilder::retry`], and async
+//!   lifecycle callbacks ([`TaskBuilder::on_success`] /
+//!   [`on_failure`](TaskBuilder::on_failure) / [`on_finish`](TaskBuilder::on_finish)).
+//! * **Non-blocking scheduling** — a slow task never delays other tasks. Control what
+//!   happens when a run overruns its interval with an [`OverlapPolicy`] via
+//!   [`TaskBuilder::overlap`].
+//! * **Observability** — query the live task set at runtime through
+//!   [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`].
 //!
 //! # Example
 //!
@@ -46,9 +51,9 @@ pub mod task;
 pub use builders::TaskBuilder;
 pub use errors::{TaskError, TaskResult};
 pub use generator::TaskGenerator;
-pub use retry::{Backoff, RetryPolicy};
-pub use scheduler::{SchedulerHandle, TaskScheduler};
-pub use task::Task;
+pub use retry::{Backoff, Jitter, RetryPolicy};
+pub use scheduler::{SchedulerHandle, TaskScheduler, TaskState};
+pub use task::{OverlapPolicy, Status, Task};
 
 /// Macro for consistent task-related logging
 ///
