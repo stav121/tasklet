@@ -10,8 +10,10 @@ use cron::Schedule;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Possible success status values for a step's execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,30 +149,65 @@ pub enum Status {
     ForceRemoved,
 }
 
-/// A message response from a task
-#[derive(Debug)]
-pub(crate) struct TaskResponse {
-    /// The id of the task as set by the scheduler
-    pub id: usize,
-    /// The status after the request has been fulfilled
-    pub status: Status,
+/// What to do when a task's next scheduled time arrives while a previous run of
+/// the same task is still in progress.
+///
+/// Concurrent overlapping runs are intentionally not offered: task steps are
+/// `FnMut` (they own mutable state), so a second simultaneous invocation would alias
+/// that state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverlapPolicy {
+    /// Skip the occurrence; the task keeps running and resumes on its next future
+    /// slot. This is the safe default.
+    #[default]
+    Skip,
+    /// Run the missed occurrence once the current run finishes (at most one queued).
+    Queue,
 }
 
+/// A command sent from the scheduler to a running task.
 #[derive(Debug)]
-/// Available commands to be sent
 pub(crate) enum TaskCmd {
-    /// Request to initialize the task
-    Init {
-        sender: oneshot::Sender<TaskResponse>,
-    },
-    /// Execute the task
-    Run {
-        sender: oneshot::Sender<TaskResponse>,
-    },
-    /// Request the rescheduling of the task
-    Reschedule {
-        sender: oneshot::Sender<TaskResponse>,
-    },
+    /// Execute the task once now.
+    Run,
+}
+
+/// State a running task publishes so the scheduler can observe it and decide when
+/// to dispatch the next run without a blocking request/response round-trip.
+#[derive(Debug)]
+pub(crate) struct TaskShared {
+    /// True while a run is in progress.
+    pub(crate) running: AtomicBool,
+    /// Set when a due occurrence was missed while running (used by [`OverlapPolicy::Queue`]).
+    pub(crate) pending: AtomicBool,
+    /// Set once the task reaches a terminal state so the scheduler reaps it.
+    pub(crate) finished: AtomicBool,
+    /// The observable lifecycle state (status + next execution time, in UTC).
+    pub(crate) state: Mutex<SharedState>,
+}
+
+/// The observable, timezone-erased portion of a task's state.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedState {
+    /// The task's current lifecycle status.
+    pub(crate) status: Status,
+    /// The task's next execution time, normalized to UTC (`None` if not scheduled).
+    pub(crate) next_exec: Option<DateTime<Utc>>,
+}
+
+impl TaskShared {
+    /// Create a fresh shared-state cell for an uninitialized task.
+    pub(crate) fn new() -> Self {
+        TaskShared {
+            running: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            state: Mutex::new(SharedState {
+                status: Status::Init,
+                next_exec: None,
+            }),
+        }
+    }
 }
 
 /// A structure that contains the basic information of the job.
@@ -207,6 +244,8 @@ where
     pub(crate) on_failure: Option<Box<CallbackFn>>,
     /// (Optional) callback invoked once when the task reaches a terminal state.
     pub(crate) on_finish: Option<Box<CallbackFn>>,
+    /// Behaviour when a scheduled run overlaps a still-running one.
+    pub(crate) overlap: OverlapPolicy,
 }
 
 impl<T> Debug for Task<T>
@@ -280,6 +319,7 @@ where
             on_success: None,
             on_failure: None,
             on_finish: None,
+            overlap: OverlapPolicy::default(),
         })
     }
 
@@ -370,6 +410,12 @@ where
         self
     }
 
+    /// Set the overlap policy.
+    pub(crate) fn set_overlap(&mut self, overlap: OverlapPolicy) -> &mut Task<T> {
+        self.overlap = overlap;
+        self
+    }
+
     /// Set the callbacks invoked over the task's lifecycle.
     pub(crate) fn set_callbacks(
         &mut self,
@@ -417,68 +463,40 @@ where
         }
     }
 
-    /// Create a `TaskResponse` from the current state of the task.
-    fn get_task_response(&self) -> TaskResponse {
-        TaskResponse {
-            id: self.task_id,
-            status: self.status.clone(),
+    /// Run the task's steps and fire the success/failure callbacks based on the
+    /// outcome. `on_finish` is fired here only for the terminal `ForceRemoved` state
+    /// (a normally-finishing task fires it from [`Task::reschedule_and_notify`]).
+    pub(crate) async fn run_and_notify(&mut self) {
+        let _ = self.run_task().await; // status is updated in place; the result is redundant
+        match self.status {
+            Status::Executed => Self::fire_callback(&mut self.on_success).await,
+            Status::Failed => Self::fire_callback(&mut self.on_failure).await,
+            Status::ForceRemoved => {
+                Self::fire_callback(&mut self.on_failure).await;
+                Self::fire_callback(&mut self.on_finish).await;
+            }
+            _ => {}
         }
     }
 
-    /// Execute a command sent by the scheduler.
-    ///
-    /// Each of the commands triggers the underlying method of the task,
-    /// and responds with the id of the task and the status of the task after the execution
-    /// of the command has finished.
-    pub(crate) async fn execute_command(&mut self, msg: TaskCmd) {
-        match msg {
-            TaskCmd::Run { sender } => {
-                // Only run if the task has been scheduled (has a next execution time)
-                // and that time is due. A missing `next_exec` means the task was never
-                // initialized; skip it gracefully instead of panicking.
-                //
-                // The comparison is scoped so the borrow of `next_exec` is released
-                // before the `.await`, keeping the resulting future `Send`.
-                let due = match &self.next_exec {
-                    Some(next_exec) => {
-                        *next_exec <= Utc::now().with_timezone(&self.timezone.clone())
-                    }
-                    None => false,
-                };
-                if due {
-                    let _ = self.run_task().await; // Ignore the result as we already update the status
-                                                   // Fire the relevant lifecycle callbacks based on the outcome.
-                                                   // `on_finish` for a force-removed task is fired here since that
-                                                   // is its terminal state; a normally-finishing task fires it in
-                                                   // the reschedule branch below.
-                    match self.status {
-                        Status::Executed => Self::fire_callback(&mut self.on_success).await,
-                        Status::Failed => Self::fire_callback(&mut self.on_failure).await,
-                        Status::ForceRemoved => {
-                            Self::fire_callback(&mut self.on_failure).await;
-                            Self::fire_callback(&mut self.on_finish).await;
-                        }
-                        _ => {}
-                    }
-                }
-                let _ = sender.send(self.get_task_response());
-            }
-            TaskCmd::Reschedule { sender } => {
-                let _ = self.reschedule(); // Ignore the result as we already update the status
-                                           // A task that has just reached the `Finished` state fires `on_finish`
-                                           // exactly once (force-removed tasks already fired it in the Run branch).
-                if self.status == Status::Finished {
-                    Self::fire_callback(&mut self.on_finish).await;
-                }
-                let _ = sender.send(self.get_task_response());
-            }
-            TaskCmd::Init { sender } => {
-                if self.status == Status::Init {
-                    self.init();
-                }
-                let _ = sender.send(self.get_task_response());
-            }
+    /// Reschedule the task and fire `on_finish` if it has just reached the
+    /// `Finished` state (exactly once; force-removed tasks fire it from
+    /// [`Task::run_and_notify`]).
+    pub(crate) async fn reschedule_and_notify(&mut self) {
+        let _ = self.reschedule(); // status is updated in place; the result is redundant
+        if self.status == Status::Finished {
+            Self::fire_callback(&mut self.on_finish).await;
         }
+    }
+
+    /// Whether the task has reached a terminal state and should be reaped.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self.status, Status::Finished | Status::ForceRemoved)
+    }
+
+    /// The next execution time normalized to UTC, for the observable snapshot.
+    pub(crate) fn next_exec_utc(&self) -> Option<DateTime<Utc>> {
+        self.next_exec.as_ref().map(|d| d.with_timezone(&Utc))
     }
 
     /// Run the task and handle the output.
@@ -573,7 +591,7 @@ where
                                 if (attempt as usize) < max_attempts {
                                     // `retry` is guaranteed `Some` here: `max_attempts > 1`
                                     // only when a retry policy is set.
-                                    let delay = retry.as_ref().unwrap().delay(attempt - 1);
+                                    let delay = retry.as_ref().unwrap().jittered_delay(attempt - 1);
                                     step_log!(
                                         self.task_id,
                                         index,
@@ -669,37 +687,73 @@ where
     }
 }
 
-/// Wrap a `Task` around a receiver, each time a command is received, forward it to the task.
-///
-/// # Arguments
-///
-/// * task  - the task to run in the background
-///
-/// # Examples
-///
-/// ```
-/// # use chrono::Utc;
-/// # use tasklet::task::Task;
-/// # use tasklet::task::run_task;
-/// # tokio_test::block_on( async {
-/// let t = Task::new("* * * * * *", None, None, Utc).unwrap();
-/// let h = tokio::spawn(run_task(t));
-/// # h.abort();
-/// # })
-/// ```
-pub async fn run_task<T>(mut task: Task<T>)
+/// Publish the task's current status and next execution time to the shared cell
+/// the scheduler observes.
+fn publish<T>(task: &Task<T>, shared: &TaskShared)
+where
+    T: TimeZone + Send + 'static,
+{
+    let mut state = shared.state.lock().unwrap();
+    state.status = task.status.clone();
+    state.next_exec = task.next_exec_utc();
+}
+
+/// Execute the task once, fire its lifecycle callbacks, reschedule it and republish
+/// the resulting state. Marks the shared `running` flag around the work and the
+/// `finished` flag if the task became terminal.
+async fn run_once<T>(task: &mut Task<T>, shared: &TaskShared)
 where
     T: TimeZone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
-    while let Some(msg) = task
+    shared.running.store(true, Ordering::SeqCst);
+    task.run_and_notify().await;
+    task.reschedule_and_notify().await;
+    shared.running.store(false, Ordering::SeqCst);
+    if task.is_terminal() {
+        shared.finished.store(true, Ordering::SeqCst);
+    }
+    publish(task, shared);
+}
+
+/// Drive a `Task` in its own Tokio task.
+///
+/// The task initializes itself, publishes its state to `shared`, then runs once for
+/// each [`TaskCmd::Run`] the scheduler dispatches. Runs never block the scheduler:
+/// the scheduler fire-and-forgets `Run` and observes progress through `shared`. When
+/// a run is queued via [`OverlapPolicy::Queue`], it is drained here once the current
+/// run finishes.
+pub(crate) async fn run_task<T>(mut task: Task<T>, shared: Arc<TaskShared>)
+where
+    T: TimeZone + Send + 'static,
+    <T as TimeZone>::Offset: Send,
+{
+    // Self-initialize and publish the first scheduled time.
+    task.init();
+    publish(&task, &shared);
+    if task.is_terminal() {
+        shared.finished.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    let mut receiver = task
         .receiver
-        .as_mut()
-        .expect("Failed to borrow receiver.")
-        .recv()
-        .await
-    {
-        task.execute_command(msg).await;
+        .take()
+        .expect("run_task requires a receiver to be set");
+
+    while let Some(TaskCmd::Run) = receiver.recv().await {
+        run_once(&mut task, &shared).await;
+        if shared.finished.load(Ordering::SeqCst) {
+            break;
+        }
+        // `OverlapPolicy::Queue`: run any occurrence that came due while we were
+        // busy, one at a time, until none remain or the task retires.
+        while shared.pending.swap(false, Ordering::SeqCst) && !task.is_terminal() {
+            run_once(&mut task, &shared).await;
+            if shared.finished.load(Ordering::SeqCst) {
+                break;
+            }
+        }
     }
 }
 
@@ -922,62 +976,51 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_task_command_execution() {
-        use chrono::Duration;
-        use tokio::sync::oneshot;
-
-        let mut task = Task::new("* * * * * * *", Some("Command test"), Some(1), Utc).unwrap();
+    async fn test_run_and_reschedule_notify() {
+        let mut task = Task::new("* * * * * * *", Some("Notify flow"), Some(1), Utc).unwrap();
         task.set_id(1);
-
-        // Add a simple step to ensure the Run command works properly
         task.add_step("Test step", || async { Ok(TaskStepStatusOk::Success) });
 
-        // Test Init command first - this should initialize the task
-        let (tx_init, rx_init) = oneshot::channel();
-        task.execute_command(TaskCmd::Init { sender: tx_init })
-            .await;
-        let init_response = rx_init.await.unwrap();
-        assert_eq!(init_response.id, 1);
-        assert_eq!(init_response.status, Status::Scheduled);
+        task.init();
+        assert_eq!(task.status, Status::Scheduled);
 
-        // Set next_exec to a future time to prevent automatic execution
-        let future_time = Utc::now() + Duration::seconds(10);
-        task.next_exec = Some(future_time);
+        // One run drives Scheduled -> Executed.
+        task.run_and_notify().await;
+        assert_eq!(task.status, Status::Executed);
 
-        // Send Run command - this should not execute the task since next_exec is in the future
-        let (tx_run_no_exec, rx_run_no_exec) = oneshot::channel();
-        task.execute_command(TaskCmd::Run {
-            sender: tx_run_no_exec,
-        })
-        .await;
-        let no_exec_response = rx_run_no_exec.await.unwrap();
-        assert_eq!(no_exec_response.id, 1);
-        assert_eq!(
-            no_exec_response.status,
-            Status::Scheduled,
-            "Task should remain Scheduled when next_exec is in the future"
-        );
+        // With the single repeat spent, rescheduling retires the task.
+        task.reschedule_and_notify().await;
+        assert_eq!(task.status, Status::Finished);
+        assert!(task.is_terminal());
+    }
 
-        // Set next_exec to a past time to allow execution
-        let past_time = Utc::now() - Duration::seconds(10);
-        task.next_exec = Some(past_time);
+    /// The `run_task` loop initializes, publishes state to the shared cell, runs on a
+    /// `Run` command, and marks itself finished when its repeat cycle is exhausted.
+    #[tokio::test]
+    async fn test_run_task_loop_publishes_and_finishes() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut task = Task::new("* * * * * * *", Some("Loop"), Some(1), Utc).unwrap();
+        task.set_id(3);
+        task.add_step_default(|| async { Ok(Success) });
+        task.set_receiver(rx);
 
-        // Send Run command - this should execute the task
-        let (tx_run, rx_run) = oneshot::channel();
-        task.execute_command(TaskCmd::Run { sender: tx_run }).await;
-        let run_response = rx_run.await.unwrap();
-        assert_eq!(run_response.id, 1);
-        assert_eq!(run_response.status, Status::Executed);
+        let shared = Arc::new(TaskShared::new());
+        let join = tokio::spawn(run_task(task, shared.clone()));
 
-        // Test Reschedule command
-        let (tx_reschedule, rx_reschedule) = oneshot::channel();
-        task.execute_command(TaskCmd::Reschedule {
-            sender: tx_reschedule,
-        })
-        .await;
-        let reschedule_response = rx_reschedule.await.unwrap();
-        assert_eq!(reschedule_response.id, 1);
-        assert_eq!(reschedule_response.status, Status::Finished);
+        // After self-initialization the task publishes Scheduled + a next execution.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        {
+            let state = shared.state.lock().unwrap();
+            assert_eq!(state.status, Status::Scheduled);
+            assert!(state.next_exec.is_some());
+        }
+
+        // Dispatch a single run; with repeat(1) the task then retires and the loop ends.
+        tx.send(TaskCmd::Run).await.unwrap();
+        join.await.unwrap();
+
+        assert!(shared.finished.load(Ordering::SeqCst));
+        assert_eq!(shared.state.lock().unwrap().status, Status::Finished);
     }
 
     #[tokio::test]
@@ -1284,7 +1327,6 @@ mod test {
     async fn test_lifecycle_callbacks_success_and_finish() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        use tokio::sync::oneshot;
 
         let success = Arc::new(AtomicUsize::new(0));
         let failure = Arc::new(AtomicUsize::new(0));
@@ -1317,19 +1359,11 @@ mod test {
 
         task.set_id(0);
         task.init();
-        // Force the task to be due.
-        task.next_exec = Some(Utc::now() - chrono::Duration::seconds(1));
 
-        // Run: fires on_success.
-        let (tx, rx) = oneshot::channel();
-        task.execute_command(TaskCmd::Run { sender: tx }).await;
-        let _ = rx.await.unwrap();
-
-        // Reschedule: repeats exhausted, so the task finishes and fires on_finish.
-        let (tx, rx) = oneshot::channel();
-        task.execute_command(TaskCmd::Reschedule { sender: tx })
-            .await;
-        let _ = rx.await.unwrap();
+        // A run fires on_success; the follow-up reschedule retires the task (repeat 1)
+        // and fires on_finish exactly once.
+        task.run_and_notify().await;
+        task.reschedule_and_notify().await;
 
         assert_eq!(success.load(Ordering::SeqCst), 1);
         assert_eq!(failure.load(Ordering::SeqCst), 0);
@@ -1341,7 +1375,6 @@ mod test {
     async fn test_lifecycle_callbacks_force_removed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        use tokio::sync::oneshot;
 
         let failure = Arc::new(AtomicUsize::new(0));
         let finish = Arc::new(AtomicUsize::new(0));
@@ -1366,11 +1399,9 @@ mod test {
 
         task.set_id(0);
         task.init();
-        task.next_exec = Some(Utc::now() - chrono::Duration::seconds(1));
 
-        let (tx, rx) = oneshot::channel();
-        task.execute_command(TaskCmd::Run { sender: tx }).await;
-        let _ = rx.await.unwrap();
+        // ForceRemoved is terminal, so run_and_notify fires both on_failure and on_finish.
+        task.run_and_notify().await;
 
         assert_eq!(failure.load(Ordering::SeqCst), 1);
         assert_eq!(finish.load(Ordering::SeqCst), 1);

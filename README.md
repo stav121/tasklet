@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.3.1"
+tasklet = "0.3.2"
 ```
 
 > **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
@@ -154,12 +154,54 @@ let _task = TaskBuilder::new(chrono::Local)
 - **Timeout** (`.timeout`) bounds each individual step attempt; a step that exceeds it is
   cancelled and treated as a (retryable) failure.
 - **Retry** (`.retry`) re-attempts a step that returns `TaskStepStatusErr::Error` (or times
-  out). Use `RetryPolicy::fixed` or `RetryPolicy::exponential`. A step returning
-  `TaskStepStatusErr::ErrorDelete` bypasses retries and removes the task immediately.
+  out). Use `RetryPolicy::fixed` or `RetryPolicy::exponential`, optionally with
+  `.with_jitter(Jitter::Full)` to spread retries out and avoid a thundering herd. A step
+  returning `TaskStepStatusErr::ErrorDelete` bypasses retries and removes the task immediately.
 - **Callbacks** (`.on_success` / `.on_failure` / `.on_finish`) are async hooks;
   `on_finish` fires once when the task reaches a terminal state.
 
 See [`examples/retry_timeout_example.rs`](/examples/retry_timeout_example.rs) for a runnable demo.
+
+## Overlap policy and non-blocking scheduling
+
+Tasks run independently: a task whose step takes longer than its interval never delays
+any other task's schedule. When a task's next scheduled time arrives while its previous
+run is still in progress, the `OverlapPolicy` decides what happens (added in 0.3.2):
+
+- **`Skip`** (default): drop that occurrence and resume on the next future slot.
+- **`Queue`**: run the missed occurrence once the current run finishes.
+
+```rust,no_run
+# use tasklet::{OverlapPolicy, TaskBuilder};
+# use tasklet::task::TaskStepStatusOk::Success;
+let _task = TaskBuilder::new(chrono::Local)
+    .every("* * * * * * *")
+    .overlap(OverlapPolicy::Queue)
+    .add_step("Step", || async { Ok(Success) })
+    .build();
+```
+
+## Observing the scheduler
+
+Grab a `SchedulerHandle` with `scheduler.handle()` and query the live task set at
+runtime (added in 0.3.2):
+
+```rust,no_run
+# use tasklet::TaskScheduler;
+# #[tokio::main]
+# async fn main() {
+let scheduler = TaskScheduler::default(chrono::Utc);
+let handle = scheduler.handle();
+
+// From anywhere, e.g. a metrics endpoint:
+println!("{} task(s) live", handle.task_count());
+for state in handle.statuses() {
+    println!("task {} is {:?} (running: {})", state.id, state.status, state.running);
+}
+# }
+```
+
+See [`examples/overlap_and_status_example.rs`](/examples/overlap_and_status_example.rs) for a runnable demo.
 
 ## Migrating from 0.2.x to 0.3.0
 

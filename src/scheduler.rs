@@ -1,44 +1,52 @@
 use crate::errors::{TaskError, TaskResult};
 use crate::generator::TaskGenerator;
-use crate::task::{run_task, Status, Task, TaskCmd, TaskResponse};
+use crate::task::{run_task, OverlapPolicy, Status, Task, TaskCmd, TaskShared};
 use crate::{scheduler_log, task_log};
 use chrono::prelude::*;
 use chrono::Utc;
-use futures::future::join_all;
-use futures::StreamExt;
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-/// Task execution possible statuses.
-#[derive(Debug, PartialEq)]
-pub(crate) enum ExecutionStatus {
-    Success(usize),
-    NoExecution,
-    HadError(usize, usize),
-}
-
-/// Handler for task threads.
-/// Contains the join handle and sender for each task.
+/// Handler for a running task.
 ///
-/// When a task is finished the handle must be destroyed and sender dropped, in order to totally remove the task from the execution context.
-///
-/// The #id must be set upon the task initialization in order to be easier to query for later use.
+/// Holds the task's join handle, the sender used to dispatch runs, and the shared
+/// state the task publishes so the scheduler can observe it without a blocking
+/// request/response round-trip.
 #[derive(Debug)]
 pub struct TaskHandle {
     id: usize,
     handle: JoinHandle<()>,
     sender: mpsc::Sender<TaskCmd>,
-    is_init: bool,
+    shared: Arc<TaskShared>,
+    overlap: OverlapPolicy,
 }
 
-/// A cloneable handle used to control a running [`TaskScheduler`].
+/// A snapshot of a single task's state, as reported by [`SchedulerHandle`].
+///
+/// This is a read-only view refreshed at the end of every scheduler round.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct TaskState {
+    /// The task's id, as assigned by the scheduler.
+    pub id: usize,
+    /// The task's lifecycle status as of the last completed round.
+    pub status: Status,
+    /// The task's next execution time, normalized to UTC (`None` if not scheduled).
+    pub next_exec: Option<DateTime<Utc>>,
+    /// Whether a run of this task is currently in progress.
+    pub running: bool,
+}
+
+/// A cloneable handle used to control and observe a running [`TaskScheduler`].
 ///
 /// Obtain one with [`TaskScheduler::handle`] *before* calling
 /// [`TaskScheduler::run`], then call [`SchedulerHandle::shutdown`] from anywhere
-/// (another task, a signal handler, etc.) to request a graceful stop.
+/// (another task, a signal handler, etc.) to request a graceful stop, or query the
+/// live task set with [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`].
 ///
 /// # Examples
 ///
@@ -60,6 +68,7 @@ pub struct TaskHandle {
 #[derive(Clone, Debug)]
 pub struct SchedulerHandle {
     notify: Arc<Notify>,
+    status: Arc<Mutex<Vec<TaskState>>>,
 }
 
 impl SchedulerHandle {
@@ -73,6 +82,28 @@ impl SchedulerHandle {
         // `notify_one` stores a permit if there is no current waiter, so a shutdown
         // requested before `run()` reaches its await point is not lost.
         self.notify.notify_one();
+    }
+
+    /// The number of tasks currently registered with the scheduler.
+    ///
+    /// The value reflects the most recently completed round.
+    pub fn task_count(&self) -> usize {
+        self.status.lock().unwrap().len()
+    }
+
+    /// A snapshot of every live task's [`TaskState`], as of the last completed round.
+    pub fn statuses(&self) -> Vec<TaskState> {
+        self.status.lock().unwrap().clone()
+    }
+
+    /// The [`Status`] of the task with the given id, if it is still registered.
+    pub fn status_of(&self, id: usize) -> Option<Status> {
+        self.status
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.status.clone())
     }
 }
 
@@ -93,6 +124,9 @@ where
     timezone: T,
     /// Notified when a graceful shutdown is requested.
     shutdown: Arc<Notify>,
+    /// Snapshot of the live tasks' states, refreshed each round and read by
+    /// [`SchedulerHandle`].
+    status: Arc<Mutex<Vec<TaskState>>>,
 }
 
 /// `TaskScheduler` implementation.
@@ -122,6 +156,7 @@ where
             timezone,
             next_id: 0,
             shutdown: Arc::new(Notify::new()),
+            status: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -137,6 +172,7 @@ where
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle {
             notify: self.shutdown.clone(),
+            status: self.status.clone(),
         }
     }
 
@@ -204,18 +240,23 @@ where
     ) -> Result<&mut TaskScheduler<T>, TaskError> {
         match task {
             Ok(mut task) => {
-                let (sender, receiver) = mpsc::channel(32);
+                // A buffer of one is enough: the scheduler only dispatches a run when
+                // the task is idle, so at most one `Run` is ever in flight.
+                let (sender, receiver) = mpsc::channel(1);
 
                 task.set_receiver(receiver);
                 task.set_id(self.next_id);
-                let handle = tokio::spawn(run_task(task));
+                let overlap = task.overlap;
+                let shared = Arc::new(TaskShared::new());
+                let handle = tokio::spawn(run_task(task, shared.clone()));
 
                 // Push the handle
                 self.handles.push(TaskHandle {
                     id: self.next_id,
                     handle,
                     sender,
-                    is_init: false,
+                    shared,
+                    overlap,
                 });
 
                 // Increase the id of the next task.
@@ -226,143 +267,72 @@ where
         }
     }
 
-    /// Execute all the tasks in the queue.
+    /// Run a single scheduling round.
     ///
-    /// After the execution the tasks are rescheduled and if needed,
-    /// removed from the list.
-    pub(crate) async fn execute_tasks(&mut self) -> ExecutionStatus {
-        let mut receivers: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
+    /// Reaps any task that has reached a terminal state, then dispatches a run to
+    /// every task whose next execution time is due. Dispatch is fire-and-forget: the
+    /// scheduler never waits for a task's run to complete, so a slow task cannot
+    /// delay any other task's schedule. The overlap policy decides what to do when a
+    /// task is still running at its next due time.
+    fn dispatch_round(&mut self) {
+        let now = Utc::now();
 
-        for handle in &self.handles {
-            let (sender, recv) = oneshot::channel();
-            let _ = handle.sender.send(TaskCmd::Run { sender }).await;
-            receivers.push(recv);
-        }
-
-        let err_no: Arc<Mutex<usize>> = Arc::new(Mutex::new(0usize));
-        let total_runs: Arc<Mutex<usize>> = Arc::new(Mutex::new(0usize));
-        futures::stream::iter(receivers)
-            .for_each(|r| async {
-                // A task whose sender was dropped (e.g. it panicked) yields a
-                // `RecvError`; log and skip it rather than bringing down the scheduler.
-                let status = match r.await {
-                    Ok(response) => response.status,
-                    Err(_) => {
-                        scheduler_log!(
-                            log::Level::Error,
-                            "A task failed to report its run status and will be skipped"
-                        );
-                        return;
-                    }
-                };
-                match status {
-                    Status::Executed => {
-                        *total_runs.lock().unwrap() += 1;
-                    }
-                    Status::Failed => {
-                        *err_no.lock().unwrap() += 1;
-                        *total_runs.lock().unwrap() += 1;
-                    }
-                    _ => { /* Do nothing */ }
-                };
-            })
-            .await;
-
-        // Send for reschedule
-        receivers = Vec::new();
-        for handle in &self.handles {
-            let (send, recv) = oneshot::channel();
-            let _ = handle
-                .sender
-                .send(TaskCmd::Reschedule { sender: send })
-                .await;
-            receivers.push(recv);
-        }
-
-        for recv in receivers {
-            let res = match recv.await {
-                Ok(res) => res,
-                Err(_) => {
-                    scheduler_log!(
-                        log::Level::Error,
-                        "A task failed to report its reschedule status and will be skipped"
-                    );
-                    continue;
-                }
-            };
-            if res.status == Status::Finished || res.status == Status::ForceRemoved {
-                for handle in &self.handles {
-                    if handle.id == res.id {
-                        task_log!(
-                            res.id,
-                            log::Level::Debug,
-                            "Removing task due to {}",
-                            if res.status == Status::Finished {
-                                "end of execution cycle"
-                            } else {
-                                "force removal"
-                            }
-                        );
-                        handle.handle.abort();
-                    }
-                }
-                let index = self.handles.iter().position(|x| x.id == res.id).unwrap();
-                self.handles.remove(index);
-            }
-        }
-
-        // Build the response
-        if *total_runs.lock().unwrap() > 0 {
-            if *err_no.lock().unwrap() == 0 {
-                ExecutionStatus::Success(*total_runs.lock().unwrap())
+        // Reap tasks that have reached a terminal state and published `finished`.
+        self.handles.retain(|handle| {
+            if handle.shared.finished.load(Ordering::SeqCst) {
+                task_log!(handle.id, log::Level::Debug, "Removing finished task");
+                handle.handle.abort();
+                false
             } else {
-                ExecutionStatus::HadError(*total_runs.lock().unwrap(), *err_no.lock().unwrap())
+                true
             }
-        } else {
-            ExecutionStatus::NoExecution
+        });
+
+        // Dispatch due tasks.
+        for handle in &self.handles {
+            let due = match handle.shared.state.lock().unwrap().next_exec {
+                Some(next) => now >= next,
+                None => false,
+            };
+            if !due {
+                continue;
+            }
+
+            if handle.shared.running.load(Ordering::SeqCst) {
+                // A previous run is still in progress: apply the overlap policy.
+                match handle.overlap {
+                    OverlapPolicy::Skip => { /* drop this occurrence */ }
+                    OverlapPolicy::Queue => {
+                        handle.shared.pending.store(true, Ordering::SeqCst);
+                    }
+                }
+            } else {
+                // Fire-and-forget. `try_send` never blocks; a full channel means a run
+                // is already queued for this idle task, so dropping the duplicate is
+                // the correct behaviour.
+                let _ = handle.sender.try_send(TaskCmd::Run);
+            }
         }
+
+        self.refresh_status();
     }
 
-    /// Send an init signal to all the tasks that are not yet initialized.
-    pub(crate) async fn init_tasks(&mut self) {
-        let mut receivers: Vec<oneshot::Receiver<TaskResponse>> = Vec::new();
-        let mut count: usize = 0;
-
-        // Send init signal to all the tasks that are not initialized yet.
-        for handle in &self.handles {
-            if !handle.is_init {
-                let (sender, recv) = oneshot::channel();
-                let _ = handle.sender.send(TaskCmd::Init { sender }).await;
-                receivers.push(recv);
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            // Await for all receivers to finish
-            join_all(receivers).await.iter().for_each(|r| match r {
-                Ok(r) => match r.status {
-                    Status::Scheduled => {
-                        self.handles
-                            .iter_mut()
-                            .filter(|h| h.id == r.id)
-                            .for_each(|h| {
-                                task_log!(h.id, log::Level::Info, "Initialized");
-                                h.is_init = true;
-                            });
-                    }
-                    _ => {
-                        task_log!(r.id, log::Level::Error, "Failed to initialize");
-                    }
-                },
-                Err(_) => {
-                    scheduler_log!(
-                        log::Level::Error,
-                        "A task failed to report its init status and will be skipped"
-                    );
+    /// Refresh the observable status snapshot from every live task's shared state.
+    fn refresh_status(&self) {
+        let snapshot = self
+            .handles
+            .iter()
+            .map(|handle| {
+                let state = handle.shared.state.lock().unwrap();
+                TaskState {
+                    id: handle.id,
+                    status: state.status.clone(),
+                    next_exec: state.next_exec,
+                    running: handle.shared.running.load(Ordering::SeqCst),
                 }
-            });
-        }
+            })
+            .collect();
+        *self.status.lock().unwrap() = snapshot;
     }
 
     /// Execute the `TaskGenerator` instance (if set).
@@ -398,31 +368,11 @@ where
         self.handles.clear();
     }
 
-    /// Run one iteration of the scheduler flow: run the generator (if due),
-    /// (re)initialize tasks and execute the current round.
-    async fn tick(&mut self) {
-        if self.run_task_gen() {
-            // Re-initialize the tasks if any new is added
-            self.init_tasks().await;
-        }
-        match self.execute_tasks().await {
-            ExecutionStatus::Success(c) => {
-                scheduler_log!(
-                    log::Level::Info,
-                    "Execution round completed successfully for {} task(s)",
-                    c
-                );
-            }
-            ExecutionStatus::HadError(c, e) => {
-                scheduler_log!(
-                    log::Level::Error,
-                    "Execution round ran {} task(s) with {} error(s)",
-                    c,
-                    e
-                );
-            }
-            _ => { /* No executions */ }
-        }
+    /// Run one iteration of the scheduler flow: run the generator (if due) and
+    /// dispatch the current round. Newly generated tasks initialize themselves.
+    fn tick(&mut self) {
+        self.run_task_gen();
+        self.dispatch_round();
     }
 
     /// Main execution loop.
@@ -483,8 +433,7 @@ where
 
         tokio::pin!(shutdown);
 
-        // Initialize the tasks
-        self.init_tasks().await;
+        // Tasks initialize themselves when spawned, so there is no separate init phase.
 
         // Drive the loop with an `Interval` rather than sleeping for a fixed amount
         // *after* each round. `sleep` would add the duration of `tick()` to every
@@ -506,7 +455,7 @@ where
                     break;
                 }
                 _ = interval.tick() => {
-                    self.tick().await;
+                    self.tick();
                 }
             }
         }
@@ -519,93 +468,216 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::task::TaskStepStatusErr::{Error, ErrorDelete};
+    use crate::task::TaskStepStatusErr::ErrorDelete;
     use crate::task::TaskStepStatusOk::Success;
     use crate::TaskBuilder;
     use chrono::Local;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
+    /// Build a task that increments `counter` once per run.
+    fn counting_task(
+        counter: &Arc<AtomicUsize>,
+        repeats: Option<usize>,
+    ) -> TaskResult<Task<Local>> {
+        let c = counter.clone();
+        let mut builder = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .add_step_default(move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(Success)
+                }
+            });
+        if let Some(r) = repeats {
+            builder = builder.repeat(r);
+        }
+        builder.build()
+    }
+
+    /// A finite task runs the expected number of times and is then reaped. (X1)
     #[tokio::test]
-    async fn test_scheduler_normal_flow() {
-        // Create a new scheduler instance.
-        let mut scheduler = TaskScheduler::new(500, Local);
-        // Add a couple of tasks.
+    async fn test_scheduler_runs_finite_task_and_reaps() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
         scheduler
-            .add_task(Task::new("* * * * * * *", None, Some(2), Local))
-            .unwrap()
+            .add_task(counting_task(&counter, Some(1)))
+            .unwrap();
+
+        let handle = scheduler.handle();
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let obs = observed.clone();
+        let observer = tokio::spawn(async move {
+            // After the single run has completed, the task must be gone.
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            obs.store(handle.task_count(), Ordering::SeqCst);
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(2000))),
+        )
+        .await
+        .expect("scheduler did not stop");
+        observer.await.unwrap();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "task should run exactly once"
+        );
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            0,
+            "finished task should be reaped"
+        );
+    }
+
+    /// A slow-running task must not delay other tasks' schedules. (X1 headline)
+    #[tokio::test]
+    async fn test_slow_task_does_not_block_others() {
+        let slow = Arc::new(AtomicUsize::new(0));
+        let fast = Arc::new(AtomicUsize::new(0));
+
+        let mut scheduler = TaskScheduler::new(100, Local);
+
+        // A slow task: records that it started, then blocks for two seconds.
+        let s = slow.clone();
+        let slow_task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .add_step_default(move || {
+                let s = s.clone();
+                async move {
+                    s.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok(Success)
+                }
+            })
+            .build();
+        scheduler.add_task(slow_task).unwrap();
+        // A fast task on the same one-second cadence.
+        scheduler.add_task(counting_task(&fast, None)).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(2500))),
+        )
+        .await
+        .expect("scheduler did not stop");
+
+        // The fast task keeps ticking even while the slow one is blocked.
+        assert!(
+            fast.load(Ordering::SeqCst) >= 2,
+            "fast task was blocked by the slow one: {} runs",
+            fast.load(Ordering::SeqCst)
+        );
+        // The slow task started once; Skip (default) prevents a second overlapping run.
+        assert_eq!(
+            slow.load(Ordering::SeqCst),
+            1,
+            "slow task should not overlap itself under Skip"
+        );
+    }
+
+    /// `dispatch_round` does not start a new run when one is in progress under Skip. (X1)
+    #[tokio::test]
+    async fn test_dispatch_skips_running_task() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler
             .add_task(Task::new("* * * * * * *", None, None, Local))
             .unwrap();
-        assert_eq!(scheduler.handles.len(), 2);
-        // Initialize the tasks.
-        scheduler.init_tasks().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        let status: ExecutionStatus = scheduler.execute_tasks().await;
-        assert_eq!(status, ExecutionStatus::Success(2));
-        assert_eq!(scheduler.handles.len(), 2);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        let status: ExecutionStatus = scheduler.execute_tasks().await;
-        assert_eq!(status, ExecutionStatus::Success(2));
-        assert_eq!(scheduler.handles.len(), 1);
+        // Allow the task to self-initialize.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Simulate a due task whose previous run is still in progress.
+        {
+            let shared = &scheduler.handles[0].shared;
+            shared.running.store(true, Ordering::SeqCst);
+            shared.state.lock().unwrap().next_exec =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        scheduler.dispatch_round();
+
+        // Skip: nothing is queued.
+        assert!(!scheduler.handles[0].shared.pending.load(Ordering::SeqCst));
     }
 
+    /// `dispatch_round` queues a missed occurrence when the policy is Queue. (X1)
     #[tokio::test]
-    async fn test_scheduler_normal_force_deletion() {
-        // Create a new scheduler instance.
-        let mut scheduler = TaskScheduler::new(500, Local);
-        // Create a task.
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
-        task.add_step_default(|| async { Err(ErrorDelete) });
-        // Add a couple of tasks.
-        scheduler
-            .add_task(Ok(task))
-            .unwrap()
-            .add_task(Task::new("* * * * * * *", None, None, Local))
-            .unwrap();
-        assert_eq!(scheduler.handles.len(), 2);
-        // Initialize the tasks.
-        scheduler.init_tasks().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        scheduler.execute_tasks().await;
-        // The first task should be force-removed at this point
-        assert_eq!(scheduler.handles.len(), 1);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        scheduler.execute_tasks().await;
-        assert_eq!(scheduler.handles.len(), 1);
+    async fn test_dispatch_queues_running_task() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .overlap(OverlapPolicy::Queue)
+            .build();
+        scheduler.add_task(task).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        {
+            let shared = &scheduler.handles[0].shared;
+            shared.running.store(true, Ordering::SeqCst);
+            shared.state.lock().unwrap().next_exec =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        scheduler.dispatch_round();
+
+        // Queue: the missed occurrence is recorded.
+        assert!(scheduler.handles[0].shared.pending.load(Ordering::SeqCst));
     }
 
+    /// `dispatch_round` dispatches a run to an idle, due task. (X1)
     #[tokio::test]
-    async fn test_scheduler_normal_flow_no_execution() {
-        // Create a new scheduler instance.
-        let mut scheduler = TaskScheduler::new(500, Local);
-        // Init the scheduler.
-        scheduler.init_tasks().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        // Run the scheduler
-        let status: ExecutionStatus = scheduler.execute_tasks().await;
-        // No tasks should be executed.
-        assert_eq!(status, ExecutionStatus::NoExecution);
+    async fn test_dispatch_runs_idle_due_task() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Force the task due while idle.
+        scheduler.handles[0].shared.state.lock().unwrap().next_exec =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+        scheduler.dispatch_round();
+
+        // Give the dispatched run a moment to execute.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    /// A force-removed task is reaped without disturbing other tasks. (X1)
     #[tokio::test]
-    async fn test_scheduler_normal_flow_error_case() {
-        // Create a new scheduler instance.
-        let mut scheduler = TaskScheduler::new(500, Local);
+    async fn test_scheduler_force_removal_isolated() {
+        let survivor = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
 
-        // Create a task.
-        let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
-        task.add_step_default(|| async { Ok(Success) });
-        // Return an error in the second step.
-        task.add_step_default(|| async { Err(Error) });
+        let mut doomed = Task::new("* * * * * * *", None, None, Local).unwrap();
+        doomed.add_step_default(|| async { Err(ErrorDelete) });
+        scheduler.add_task(Ok(doomed)).unwrap();
+        scheduler.add_task(counting_task(&survivor, None)).unwrap();
 
-        // Add a task.
-        scheduler.add_task(Ok(task)).unwrap();
-        assert_eq!(scheduler.handles.len(), 1);
-        // Initialize the task.
-        scheduler.init_tasks().await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        scheduler.execute_tasks().await;
-        // The task should be removed after it's execution circle.
-        assert_eq!(scheduler.handles.len(), 0);
+        let handle = scheduler.handle();
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let obs = observed.clone();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            obs.store(handle.task_count(), Ordering::SeqCst);
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(2000))),
+        )
+        .await
+        .expect("scheduler did not stop");
+        observer.await.unwrap();
+
+        // Only the surviving task remains, and it kept running.
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "doomed task should be reaped"
+        );
+        assert!(survivor.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
@@ -715,5 +787,78 @@ mod test {
         .await
         .expect("run_until did not stop when its shutdown future resolved");
         assert_eq!(scheduler.handles.len(), 0);
+    }
+
+    /// The handle reports the live task count and per-task status while running. (O1)
+    #[tokio::test]
+    async fn test_handle_status_queries() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap()
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+
+        let handle = scheduler.handle();
+        // Before running, the snapshot is empty.
+        assert_eq!(handle.task_count(), 0);
+
+        let probe = handle.clone();
+        let observer = tokio::spawn(async move {
+            // Once the tasks have initialized and been observed at least once.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            (
+                probe.task_count(),
+                probe.statuses(),
+                probe.status_of(0),
+                probe.status_of(1),
+                probe.status_of(99),
+            )
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(800))),
+        )
+        .await
+        .expect("scheduler did not stop");
+        let (count, statuses, s0, s1, s99) = observer.await.unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().all(|t| t.status == Status::Scheduled));
+        assert!(statuses.iter().all(|t| t.next_exec.is_some()));
+        assert_eq!(s0, Some(Status::Scheduled));
+        assert_eq!(s1, Some(Status::Scheduled));
+        assert_eq!(s99, None);
+    }
+
+    /// A finished task drops out of the handle's snapshot. (O1)
+    #[tokio::test]
+    async fn test_handle_status_drops_finished_task() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, Some(1), Local))
+            .unwrap();
+        let handle = scheduler.handle();
+
+        let probe = handle.clone();
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let obs = observed.clone();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            obs.store(probe.task_count(), Ordering::SeqCst);
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(2000))),
+        )
+        .await
+        .expect("scheduler did not stop");
+        observer.await.unwrap();
+
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.status_of(0), None);
     }
 }

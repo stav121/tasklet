@@ -1,6 +1,6 @@
 [package]
 name = "tasklet"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 rust-version = "1.90.0"
@@ -18,8 +18,9 @@ log = "0.4.29"
 # Notify, timers and the `select!`/`pin!` macros. Downstream crates can enable
 # more features themselves.
 tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros"] }
-futures = "0.3.31"
 thiserror = "2.0.17"
+# Small, dependency-free PRNG used only for retry backoff jitter.
+fastrand = "2.3"
 
 [dev-dependencies]
 simple_logger = "5.1.0"

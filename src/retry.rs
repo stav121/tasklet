@@ -9,6 +9,44 @@
 
 use std::time::Duration;
 
+/// Randomized spread applied on top of the computed backoff delay.
+///
+/// Jitter avoids a "thundering herd" where many tasks that failed at the same
+/// instant all retry at exactly the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Jitter {
+    /// No jitter; use the computed delay exactly.
+    #[default]
+    None,
+    /// Pick a delay uniformly in `[0, computed]`.
+    Full,
+    /// Pick a delay uniformly in `[computed / 2, computed]`.
+    Equal,
+}
+
+impl Jitter {
+    /// Apply the jitter strategy to a computed backoff `delay`.
+    fn apply(self, delay: Duration) -> Duration {
+        match self {
+            Jitter::None => delay,
+            Jitter::Full => {
+                let nanos = clamp_nanos(delay);
+                Duration::from_nanos(fastrand::u64(0..=nanos))
+            }
+            Jitter::Equal => {
+                let half = clamp_nanos(delay) / 2;
+                Duration::from_nanos(half + fastrand::u64(0..=half))
+            }
+        }
+    }
+}
+
+/// Clamp a duration to a `u64` nanosecond count (durations this large never occur
+/// in practice, but this keeps the conversion total).
+fn clamp_nanos(delay: Duration) -> u64 {
+    delay.as_nanos().min(u64::MAX as u128) as u64
+}
+
 /// The delay strategy applied between retry attempts.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backoff {
@@ -46,6 +84,8 @@ pub struct RetryPolicy {
     pub max_retries: usize,
     /// The backoff strategy applied between attempts.
     pub backoff: Backoff,
+    /// The randomized spread applied on top of the computed delay.
+    pub jitter: Jitter,
 }
 
 impl RetryPolicy {
@@ -67,6 +107,7 @@ impl RetryPolicy {
         RetryPolicy {
             max_retries,
             backoff: Backoff::Fixed(delay),
+            jitter: Jitter::None,
         }
     }
 
@@ -95,6 +136,7 @@ impl RetryPolicy {
                 factor,
                 max: None,
             },
+            jitter: Jitter::None,
         }
     }
 
@@ -115,7 +157,24 @@ impl RetryPolicy {
         self
     }
 
-    /// Compute the delay to wait before the retry at the given (0-indexed) position.
+    /// Apply a [`Jitter`] strategy to spread retries out in time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use tasklet::retry::Jitter;
+    /// # use tasklet::RetryPolicy;
+    /// let _ = RetryPolicy::exponential(4, Duration::from_millis(100), 2)
+    ///     .with_jitter(Jitter::Full);
+    /// ```
+    pub fn with_jitter(mut self, jitter: Jitter) -> Self {
+        self.jitter = jitter;
+        self
+    }
+
+    /// Compute the deterministic backoff delay before the retry at the given
+    /// (0-indexed) position, ignoring jitter.
     ///
     /// Overflow-safe: an exponential delay that would overflow saturates rather than
     /// panicking.
@@ -132,6 +191,12 @@ impl RetryPolicy {
                 }
             }
         }
+    }
+
+    /// The actual delay to sleep before the given retry, including any configured
+    /// jitter. This is what the scheduler uses at runtime.
+    pub(crate) fn jittered_delay(&self, retry_index: u32) -> Duration {
+        self.jitter.apply(self.delay(retry_index))
     }
 }
 
@@ -182,5 +247,52 @@ mod test {
         let policy = RetryPolicy::fixed(2, Duration::from_millis(50))
             .with_max_delay(Duration::from_millis(10));
         assert_eq!(policy.delay(0), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn jitter_defaults_to_none() {
+        let policy = RetryPolicy::fixed(2, Duration::from_millis(100));
+        assert_eq!(policy.jitter, Jitter::None);
+        // Without jitter, the runtime delay equals the deterministic base.
+        assert_eq!(policy.jittered_delay(0), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn full_jitter_stays_within_bounds() {
+        fastrand::seed(42);
+        let base = Duration::from_millis(100);
+        let policy = RetryPolicy::fixed(3, base).with_jitter(Jitter::Full);
+        for _ in 0..1000 {
+            let d = policy.jittered_delay(0);
+            assert!(d <= base, "full jitter must not exceed the base delay");
+        }
+    }
+
+    #[test]
+    fn equal_jitter_stays_within_bounds() {
+        fastrand::seed(7);
+        let base = Duration::from_millis(100);
+        let policy = RetryPolicy::exponential(3, base, 2).with_jitter(Jitter::Equal);
+        for _ in 0..1000 {
+            // retry_index 1 => base * 2 = 200ms; equal jitter => [100ms, 200ms].
+            let d = policy.jittered_delay(1);
+            assert!(
+                d >= Duration::from_millis(100) && d <= Duration::from_millis(200),
+                "equal jitter out of bounds: {:?}",
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_produces_varied_values() {
+        fastrand::seed(123);
+        let policy = RetryPolicy::fixed(3, Duration::from_millis(100)).with_jitter(Jitter::Full);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            seen.insert(policy.jittered_delay(0).as_nanos());
+        }
+        // With full jitter over 50 draws we expect more than a single value.
+        assert!(seen.len() > 1, "jitter should vary the delay");
     }
 }

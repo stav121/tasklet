@@ -1,7 +1,7 @@
 use crate::errors::{TaskError, TaskResult};
 use crate::retry::RetryPolicy;
 use crate::task::{
-    boxed_callback, CallbackFn, Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk,
+    boxed_callback, CallbackFn, OverlapPolicy, Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk,
 };
 use chrono::TimeZone;
 use cron::Schedule;
@@ -36,6 +36,8 @@ where
     on_failure: Option<Box<CallbackFn>>,
     /// (Optional) callback invoked once the task reaches a terminal state.
     on_finish: Option<Box<CallbackFn>>,
+    /// Behaviour when a run overlaps a still-running one.
+    overlap: OverlapPolicy,
     /// The Task/Scheduler timezone.
     timezone: T,
 }
@@ -68,6 +70,7 @@ where
             on_success: None,
             on_failure: None,
             on_finish: None,
+            overlap: OverlapPolicy::default(),
             timezone,
         }
     }
@@ -177,6 +180,28 @@ where
     /// ```
     pub fn retry(mut self, policy: RetryPolicy) -> TaskBuilder<T> {
         self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the overlap policy: what to do when a scheduled run comes due while a
+    /// previous run of this task is still in progress.
+    ///
+    /// # Arguments
+    ///
+    /// * overlap   - The [`OverlapPolicy`] to apply (defaults to `Skip`).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::{OverlapPolicy, TaskBuilder};
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .overlap(OverlapPolicy::Queue)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn overlap(mut self, overlap: OverlapPolicy) -> TaskBuilder<T> {
+        self.overlap = overlap;
         self
     }
 
@@ -348,6 +373,7 @@ where
         if let Some(policy) = self.retry_policy {
             task.set_retry_policy(policy);
         }
+        task.set_overlap(self.overlap);
 
         // Transfer the lifecycle callbacks.
         task.set_callbacks(self.on_success, self.on_failure, self.on_finish);
