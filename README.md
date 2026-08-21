@@ -25,8 +25,8 @@ in order to run tasks asynchronously.
 | chrono    | 0.4.42  |
 | log       | 0.4.29  |
 | tokio     | 1.48.0  |
-| futures   | 0.3.31  |
 | thiserror | 2.0.17  |
+| fastrand  | 2.3     |
 
 ## How to use this library
 
@@ -34,7 +34,15 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.3.2"
+tasklet = "0.4.0"
+```
+
+To derive `serde` on the observable state types (`TaskState`, `Status`, `RunRecord`,
+`StepState`, ...) for a control plane or API, enable the optional `serde` feature:
+
+```
+[dependencies]
+tasklet = { version = "0.4.0", features = ["serde"] }
 ```
 
 > **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
@@ -202,6 +210,72 @@ for state in handle.statuses() {
 ```
 
 See [`examples/overlap_and_status_example.rs`](/examples/overlap_and_status_example.rs) for a runnable demo.
+
+## Naming, runtime control and history
+
+Give a task a stable name and address it at runtime through the handle (added in 0.4.0).
+Names are unique within a scheduler; `add_task` rejects a duplicate with
+`TaskError::DuplicateTaskName`.
+
+```rust,no_run
+# use tasklet::{TaskBuilder, TaskScheduler};
+# use tasklet::task::TaskStepStatusOk::Success;
+# #[tokio::main]
+# async fn main() {
+let mut scheduler = TaskScheduler::default(chrono::Local);
+scheduler
+    .add_task(
+        TaskBuilder::new(chrono::Local)
+            .every("* * * * * * *")
+            .name("report")
+            .add_step("Step", || async { Ok(Success) })
+            .build(),
+    )
+    .unwrap();
+
+let handle = scheduler.handle();
+tokio::spawn(async move {
+    // Control a task by name (or by id) while the scheduler runs:
+    handle.pause_name("report");
+    handle.trigger_name("report"); // run once now, off-schedule
+    handle.resume_name("report");
+
+    // Observe what it did:
+    if let Some(id) = handle.id_of_name("report") {
+        let runs = handle.history(id);            // recent RunRecords
+        let steps = handle.step_states(id);       // per-step outcomes
+        println!("{} run(s), {} step(s)", runs.len(), steps.len());
+    }
+    handle.remove_name("report"); // reaped on the next round
+});
+
+scheduler.run().await;
+# }
+```
+
+Every `TaskState` from `handle.statuses()` now also carries the task's `name`, whether it
+is `paused`, its `run_count` and its `last_outcome`.
+
+## Sharing data between tasks
+
+A `Blackboard` is a cheaply-clonable, typed key/value store. Clone it into as many
+task/step closures as you like; they all read and write the same storage, replacing the
+ad-hoc `Arc<Mutex<HashMap<...>>>` boilerplate.
+
+```rust
+use tasklet::Blackboard;
+
+let board = Blackboard::new();
+board.set("attempts", 0u32);
+
+let shared = board.clone();
+shared.set("attempts", 3u32);
+
+assert_eq!(board.get::<u32>("attempts"), Some(3));
+```
+
+See [`examples/control_and_observability.rs`](/examples/control_and_observability.rs) for a
+runnable demo combining names, control, history and a shared blackboard.
 
 ## Migrating from 0.2.x to 0.3.0
 

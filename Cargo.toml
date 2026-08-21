@@ -1,6 +1,6 @@
 [package]
 name = "tasklet"
-version = "0.3.2"
+version = "0.4.0"
 authors = ["Stavros Grigoriou <unix121@protonmail.com>"]
 edition = "2021"
 rust-version = "1.90.0"
@@ -21,10 +21,21 @@ tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros"] }
 thiserror = "2.0.17"
 # Small, dependency-free PRNG used only for retry backoff jitter.
 fastrand = "2.3"
+# Optional: enables `Serialize`/`Deserialize` on the observable state types
+# (`TaskState`, `Status`, `StepState`, `RunRecord`, ...) behind the `serde` feature.
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+# Derive serde on the observable, read-only state types so a control plane / API can
+# emit them. Pulls in `serde` and chrono's serde integration for the timestamps.
+serde = ["dep:serde", "chrono/serde"]
 
 [dev-dependencies]
 simple_logger = "5.1.0"
 tokio-test = "0.4.4"
+# Used only by the `serde`-gated round-trip tests.
+serde_json = "1.0"
 # Examples and tests need the macros and a multi-thread runtime on top of the
 # library's minimal feature set.
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }

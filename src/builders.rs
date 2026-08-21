@@ -2,6 +2,7 @@ use crate::errors::{TaskError, TaskResult};
 use crate::retry::RetryPolicy;
 use crate::task::{
     boxed_callback, CallbackFn, OverlapPolicy, Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk,
+    DEFAULT_HISTORY_LIMIT,
 };
 use chrono::TimeZone;
 use cron::Schedule;
@@ -17,6 +18,10 @@ where
 {
     /// An optional task description.
     description: Option<String>,
+    /// An optional unique name used to address the task at runtime.
+    name: Option<String>,
+    /// The maximum number of run records to retain for the task.
+    history_limit: usize,
     /// The provided `TaskStep` vector.
     steps: Vec<TaskStep>,
     /// The provided `Schedule`, if not given,
@@ -62,6 +67,8 @@ where
         TaskBuilder {
             steps: Vec::new(),
             description: None,
+            name: None,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             schedule: None,
             expression: "* * * * * * *".to_string(), // Default expression
             repeats: None,
@@ -87,6 +94,59 @@ where
     /// ```
     pub fn description(mut self, description: &str) -> TaskBuilder<T> {
         self.description = Some(description.to_string());
+        self
+    }
+
+    /// Set a unique name for the generated `Task`.
+    ///
+    /// A name is a stable, human-friendly identifier that can be used to address the
+    /// task at runtime through a [`SchedulerHandle`](crate::SchedulerHandle) (pause,
+    /// resume, trigger, remove, query). Names must be unique within a scheduler:
+    /// [`add_task`](crate::TaskScheduler::add_task) rejects a duplicate with
+    /// [`TaskError::DuplicateTaskName`](crate::TaskError::DuplicateTaskName).
+    ///
+    /// # Arguments
+    ///
+    /// * name  - A unique name for the task.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .name("nightly-report")
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn name(mut self, name: &str) -> TaskBuilder<T> {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    /// Set how many recent run records the generated `Task` retains.
+    ///
+    /// The scheduler keeps a bounded, per-task history of
+    /// [`RunRecord`](crate::task::RunRecord)s observable through a
+    /// [`SchedulerHandle`](crate::SchedulerHandle). The default is
+    /// 20; a value of `0` disables history (runs are still counted).
+    ///
+    /// # Arguments
+    ///
+    /// * limit - The maximum number of run records to keep.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .history_limit(100)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn history_limit(mut self, limit: usize) -> TaskBuilder<T> {
+        self.history_limit = limit;
         self
     }
 
@@ -366,6 +426,12 @@ where
         // Set the steps
         task.set_steps(self.steps);
 
+        // Transfer the identity / history configuration.
+        if let Some(name) = self.name.as_deref() {
+            task.set_name(name);
+        }
+        task.set_history_limit(self.history_limit);
+
         // Transfer the optional timeout / retry configuration.
         if let Some(timeout) = self.timeout {
             task.set_timeout(timeout);
@@ -509,5 +575,29 @@ mod test {
             Err(TaskError::InvalidCronExpression(_)) => {} // Expected
             _ => panic!("Expected InvalidCronExpression error"),
         }
+    }
+
+    /// `name` and `history_limit` are transferred onto the built task. (Layer 0)
+    #[test]
+    fn test_task_builder_name_and_history_limit() {
+        let task = TaskBuilder::new(chrono::Utc)
+            .every("* * * * * * *")
+            .name("my-task")
+            .history_limit(5)
+            .build()
+            .unwrap();
+        assert_eq!(task.name.as_deref(), Some("my-task"));
+        assert_eq!(task.history_limit, 5);
+    }
+
+    /// The default history limit is applied when not overridden. (Layer 0)
+    #[test]
+    fn test_task_builder_default_history_limit() {
+        let task = TaskBuilder::new(chrono::Utc)
+            .every("* * * * * * *")
+            .build()
+            .unwrap();
+        assert_eq!(task.history_limit, DEFAULT_HISTORY_LIMIT);
+        assert!(task.name.is_none());
     }
 }

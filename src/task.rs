@@ -7,13 +7,17 @@ use crate::{step_log, task_log};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
+use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// The default number of past [`RunRecord`]s kept per task.
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 /// Possible success status values for a step's execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +137,7 @@ impl TaskStep {
 
 /// Available task statuses.
 #[derive(Debug, PartialEq, Default, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Status {
     #[default]
     /// The task is not initialized yet.
@@ -147,6 +152,68 @@ pub enum Status {
     Finished,
     /// The task is forcibly removed from the execution list due to fatal error.
     ForceRemoved,
+}
+
+/// The observable status of a single step within a task run.
+///
+/// Reflects the most recently completed run: before the first run every step is
+/// [`StepStatus::Pending`].
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StepStatus {
+    /// The step has not run yet in the current cycle.
+    #[default]
+    Pending,
+    /// The step completed successfully.
+    Succeeded,
+    /// The step completed but reported non-fatal errors.
+    HadErrors,
+    /// The step failed (after exhausting any retries) or timed out.
+    Failed,
+    /// The step did not run because an earlier step failed.
+    Skipped,
+}
+
+/// A read-only view of a single step's identity and last-run outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StepState {
+    /// The step's zero-based position within the task.
+    pub index: usize,
+    /// The step's optional description.
+    pub description: Option<String>,
+    /// The step's status as of the last completed run.
+    pub status: StepStatus,
+}
+
+/// The outcome of a single task run, recorded in the task's [`RunRecord`] history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RunOutcome {
+    /// Every step succeeded.
+    Success,
+    /// The run completed but at least one step reported non-fatal errors.
+    HadErrors,
+    /// A step failed after exhausting any retries.
+    Failed,
+    /// A step requested force-removal of the task.
+    ForceRemoved,
+}
+
+/// A record of one execution of a task, kept in a bounded per-task history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RunRecord {
+    /// A per-task monotonically increasing run identifier.
+    pub run_id: usize,
+    /// When the run started (UTC).
+    pub started_at: DateTime<Utc>,
+    /// When the run finished (UTC); `None` while the run is still in progress.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// The run's outcome; `None` while the run is still in progress.
+    pub outcome: Option<RunOutcome>,
+    /// The total number of step attempts made during the run (including retries).
+    pub attempts: usize,
 }
 
 /// What to do when a task's next scheduled time arrives while a previous run of
@@ -182,8 +249,22 @@ pub(crate) struct TaskShared {
     pub(crate) pending: AtomicBool,
     /// Set once the task reaches a terminal state so the scheduler reaps it.
     pub(crate) finished: AtomicBool,
+    /// Set while the task is paused; a paused task is not dispatched.
+    pub(crate) paused: AtomicBool,
+    /// Set when a caller has requested removal; the scheduler reaps the task next round.
+    pub(crate) remove_requested: AtomicBool,
+    /// Total number of runs started over the task's lifetime.
+    pub(crate) runs: AtomicUsize,
+    /// The next run id to hand out.
+    run_seq: AtomicUsize,
+    /// The maximum number of [`RunRecord`]s retained in `history`.
+    history_limit: usize,
     /// The observable lifecycle state (status + next execution time, in UTC).
     pub(crate) state: Mutex<SharedState>,
+    /// The per-step state as of the last completed run.
+    pub(crate) steps: Mutex<Vec<StepState>>,
+    /// A bounded history of recent runs, oldest first.
+    pub(crate) history: Mutex<VecDeque<RunRecord>>,
 }
 
 /// The observable, timezone-erased portion of a task's state.
@@ -197,15 +278,62 @@ pub(crate) struct SharedState {
 
 impl TaskShared {
     /// Create a fresh shared-state cell for an uninitialized task.
-    pub(crate) fn new() -> Self {
+    ///
+    /// `history_limit` bounds how many [`RunRecord`]s are retained.
+    pub(crate) fn new(history_limit: usize) -> Self {
         TaskShared {
             running: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            remove_requested: AtomicBool::new(false),
+            runs: AtomicUsize::new(0),
+            run_seq: AtomicUsize::new(0),
+            history_limit,
             state: Mutex::new(SharedState {
                 status: Status::Init,
                 next_exec: None,
             }),
+            steps: Mutex::new(Vec::new()),
+            history: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Record the start of a run and return its run id. Trims the history to the
+    /// configured limit.
+    fn start_run(&self, started_at: DateTime<Utc>) -> usize {
+        let run_id = self.run_seq.fetch_add(1, Ordering::SeqCst);
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let mut history = self.history.lock().unwrap();
+        while history.len() >= self.history_limit && !history.is_empty() {
+            history.pop_front();
+        }
+        // A `history_limit` of zero disables history entirely.
+        if self.history_limit > 0 {
+            history.push_back(RunRecord {
+                run_id,
+                started_at,
+                finished_at: None,
+                outcome: None,
+                attempts: 0,
+            });
+        }
+        run_id
+    }
+
+    /// Record the completion of the run with the given id.
+    fn finish_run(
+        &self,
+        run_id: usize,
+        finished_at: DateTime<Utc>,
+        outcome: RunOutcome,
+        attempts: usize,
+    ) {
+        let mut history = self.history.lock().unwrap();
+        if let Some(record) = history.iter_mut().rev().find(|r| r.run_id == run_id) {
+            record.finished_at = Some(finished_at);
+            record.outcome = Some(outcome);
+            record.attempts = attempts;
         }
     }
 }
@@ -223,10 +351,18 @@ where
     pub(crate) repeats: Option<usize>,
     /// (Optional) Task's description.
     pub(crate) description: String,
+    /// (Optional) caller-supplied unique name used to address the task at runtime.
+    pub(crate) name: Option<String>,
     /// The timezone of the task.
     pub(crate) timezone: T,
     /// (Internal) task id.
     pub(crate) task_id: usize,
+    /// (Internal) per-step state of the last run, republished after every run.
+    pub(crate) step_states: Vec<StepState>,
+    /// (Internal) total step attempts made during the last run.
+    pub(crate) last_attempts: usize,
+    /// The maximum number of run records retained for this task.
+    pub(crate) history_limit: usize,
     /// (Internal) next execution time.
     pub(crate) next_exec: Option<DateTime<T>>,
     /// (Internal) task status.
@@ -308,9 +444,13 @@ where
                 Some(s) => s.to_string(),
                 None => "-".to_string(),
             },
+            name: None,
             repeats,
             timezone,
             task_id: 0,
+            step_states: Vec::new(),
+            last_attempts: 0,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             status: Status::default(),
             next_exec: None,
             receiver: None,
@@ -416,6 +556,33 @@ where
         self
     }
 
+    /// Set the task's unique name.
+    pub(crate) fn set_name(&mut self, name: &str) -> &mut Task<T> {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    /// Set the maximum number of run records retained for this task.
+    pub(crate) fn set_history_limit(&mut self, limit: usize) -> &mut Task<T> {
+        self.history_limit = limit;
+        self
+    }
+
+    /// Rebuild the per-step snapshot from the current steps, marking every step
+    /// [`StepStatus::Pending`].
+    fn reset_step_states(&mut self) {
+        self.step_states = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| StepState {
+                index,
+                description: step.description.clone(),
+                status: StepStatus::Pending,
+            })
+            .collect();
+    }
+
     /// Set the callbacks invoked over the task's lifecycle.
     pub(crate) fn set_callbacks(
         &mut self,
@@ -443,6 +610,8 @@ where
     /// * id - The task's id.
     pub(crate) fn init(&mut self) {
         task_log!(self.task_id, log::Level::Debug, "Initializing");
+        // Seed the step snapshot so observers see the step list before the first run.
+        self.reset_step_states();
         match self.schedule.upcoming(self.timezone.clone()).next() {
             Some(next) => {
                 self.next_exec = Some(next);
@@ -494,6 +663,27 @@ where
         matches!(self.status, Status::Finished | Status::ForceRemoved)
     }
 
+    /// Classify the outcome of the run that just completed, based on the status and
+    /// the per-step snapshot. Call this after `run_and_notify` and before
+    /// `reschedule`, which would otherwise overwrite the status.
+    pub(crate) fn run_outcome(&self) -> RunOutcome {
+        match self.status {
+            Status::ForceRemoved => RunOutcome::ForceRemoved,
+            Status::Failed => RunOutcome::Failed,
+            _ => {
+                if self
+                    .step_states
+                    .iter()
+                    .any(|s| s.status == StepStatus::HadErrors)
+                {
+                    RunOutcome::HadErrors
+                } else {
+                    RunOutcome::Success
+                }
+            }
+        }
+    }
+
     /// The next execution time normalized to UTC, for the observable snapshot.
     pub(crate) fn next_exec_utc(&self) -> Option<DateTime<Utc>> {
         self.next_exec.as_ref().map(|d| d.with_timezone(&Utc))
@@ -520,6 +710,10 @@ where
                 let retry = self.retry_policy.clone();
                 let max_attempts = 1 + retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
 
+                // Rebuild the per-step snapshot for this run and reset the attempt count.
+                self.reset_step_states();
+                self.last_attempts = 0;
+
                 let mut had_error: bool = false;
                 for (index, step) in self.steps.iter_mut().enumerate() {
                     if had_error {
@@ -531,6 +725,7 @@ where
                     let mut attempt: u32 = 0;
                     loop {
                         attempt += 1;
+                        self.last_attempts += 1;
 
                         // Run the step, optionally bounded by the configured timeout.
                         // A timeout is treated as a (retryable) `Error`.
@@ -557,20 +752,26 @@ where
                         match result {
                             Ok(status) => {
                                 match status {
-                                    TaskStepStatusOk::Success => step_log!(
-                                        self.task_id,
-                                        index,
-                                        log::Level::Debug,
-                                        "Executed successfully - {}",
-                                        step
-                                    ),
-                                    TaskStepStatusOk::HadErrors => step_log!(
-                                        self.task_id,
-                                        index,
-                                        log::Level::Debug,
-                                        "Executed with non-fatal errors - {}",
-                                        step
-                                    ),
+                                    TaskStepStatusOk::Success => {
+                                        step_log!(
+                                            self.task_id,
+                                            index,
+                                            log::Level::Debug,
+                                            "Executed successfully - {}",
+                                            step
+                                        );
+                                        self.step_states[index].status = StepStatus::Succeeded;
+                                    }
+                                    TaskStepStatusOk::HadErrors => {
+                                        step_log!(
+                                            self.task_id,
+                                            index,
+                                            log::Level::Debug,
+                                            "Executed with non-fatal errors - {}",
+                                            step
+                                        );
+                                        self.step_states[index].status = StepStatus::HadErrors;
+                                    }
                                 }
                                 self.status = Status::Executed;
                                 break;
@@ -583,6 +784,7 @@ where
                                     "Execution failed and task is marked for deletion - {}",
                                     step
                                 );
+                                self.step_states[index].status = StepStatus::Failed;
                                 self.status = Status::ForceRemoved;
                                 had_error = true;
                                 break;
@@ -614,11 +816,18 @@ where
                                     "Execution failed - {}",
                                     step
                                 );
+                                self.step_states[index].status = StepStatus::Failed;
                                 self.status = Status::Failed;
                                 had_error = true;
                                 break;
                             }
                         }
+                    }
+                }
+                // Any step still pending was never reached because an earlier step failed.
+                for step_state in self.step_states.iter_mut() {
+                    if step_state.status == StepStatus::Pending {
+                        step_state.status = StepStatus::Skipped;
                     }
                 }
                 // Avoid underflow in case of a task without steps.
@@ -693,9 +902,12 @@ fn publish<T>(task: &Task<T>, shared: &TaskShared)
 where
     T: TimeZone + Send + 'static,
 {
-    let mut state = shared.state.lock().unwrap();
-    state.status = task.status.clone();
-    state.next_exec = task.next_exec_utc();
+    {
+        let mut state = shared.state.lock().unwrap();
+        state.status = task.status.clone();
+        state.next_exec = task.next_exec_utc();
+    }
+    *shared.steps.lock().unwrap() = task.step_states.clone();
 }
 
 /// Execute the task once, fire its lifecycle callbacks, reschedule it and republish
@@ -706,10 +918,14 @@ where
     T: TimeZone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
+    let run_id = shared.start_run(Utc::now());
     shared.running.store(true, Ordering::SeqCst);
     task.run_and_notify().await;
+    // Capture the outcome before `reschedule` overwrites the status.
+    let outcome = task.run_outcome();
     task.reschedule_and_notify().await;
     shared.running.store(false, Ordering::SeqCst);
+    shared.finish_run(run_id, Utc::now(), outcome, task.last_attempts);
     if task.is_terminal() {
         shared.finished.store(true, Ordering::SeqCst);
     }
@@ -1004,7 +1220,7 @@ mod test {
         task.add_step_default(|| async { Ok(Success) });
         task.set_receiver(rx);
 
-        let shared = Arc::new(TaskShared::new());
+        let shared = Arc::new(TaskShared::new(DEFAULT_HISTORY_LIMIT));
         let join = tokio::spawn(run_task(task, shared.clone()));
 
         // After self-initialization the task publishes Scheduled + a next execution.
@@ -1405,5 +1621,114 @@ mod test {
 
         assert_eq!(failure.load(Ordering::SeqCst), 1);
         assert_eq!(finish.load(Ordering::SeqCst), 1);
+    }
+
+    /// Step states track each step's outcome; a step after a failure is skipped. (Layer 0)
+    #[tokio::test]
+    async fn test_step_states_track_outcomes() {
+        let mut task = Task::new("* * * * * * *", Some("Steps"), Some(1), Utc).unwrap();
+        task.add_step("ok", || async { Ok(Success) });
+        task.add_step("boom", || async { Err(Error) });
+        task.add_step("never", || async { Ok(Success) });
+        task.set_id(0);
+        task.init();
+
+        // Before the first run every step is pending, with descriptions preserved.
+        assert_eq!(task.step_states.len(), 3);
+        assert!(task
+            .step_states
+            .iter()
+            .all(|s| s.status == StepStatus::Pending));
+        assert_eq!(task.step_states[0].description.as_deref(), Some("ok"));
+
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.step_states[0].status, StepStatus::Succeeded);
+        assert_eq!(task.step_states[1].status, StepStatus::Failed);
+        assert_eq!(task.step_states[2].status, StepStatus::Skipped);
+        assert_eq!(task.last_attempts, 2);
+    }
+
+    /// A step returning `HadErrors` classifies the run outcome as `HadErrors`. (Layer 0)
+    #[tokio::test]
+    async fn test_run_outcome_had_errors() {
+        let mut task = Task::new("* * * * * * *", None, Some(1), Utc).unwrap();
+        task.add_step_default(|| async { Ok(TaskStepStatusOk::HadErrors) });
+        task.init();
+        assert!(task.run_task().await.is_ok());
+        assert_eq!(task.step_states[0].status, StepStatus::HadErrors);
+        assert_eq!(task.run_outcome(), RunOutcome::HadErrors);
+    }
+
+    /// Run history records each run's outcome and is bounded by the history limit. (Layer 0)
+    #[tokio::test]
+    async fn test_run_history_records_and_caps() {
+        let mut task = Task::new("* * * * * * *", Some("Hist"), None, Utc).unwrap();
+        task.set_id(0);
+        task.set_history_limit(2);
+        task.add_step_default(|| async { Ok(Success) });
+        task.init();
+
+        let shared = TaskShared::new(task.history_limit);
+        for _ in 0..3 {
+            run_once(&mut task, &shared).await;
+        }
+
+        let hist = shared.history.lock().unwrap().clone();
+        // Only the two most recent runs are retained, oldest first.
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist.front().unwrap().run_id, 1);
+        assert_eq!(hist.back().unwrap().run_id, 2);
+        assert!(hist
+            .iter()
+            .all(|r| r.outcome == Some(RunOutcome::Success) && r.finished_at.is_some()));
+        // The lifetime counter is not bounded by the retained history.
+        assert_eq!(shared.runs.load(Ordering::SeqCst), 3);
+        // The per-step snapshot is published to the shared cell.
+        assert_eq!(
+            shared.steps.lock().unwrap()[0].status,
+            StepStatus::Succeeded
+        );
+    }
+
+    /// A `history_limit` of zero disables run history but still counts runs. (Layer 0)
+    #[tokio::test]
+    async fn test_history_limit_zero_disables_history() {
+        let mut task = Task::new("* * * * * * *", None, None, Utc).unwrap();
+        task.set_history_limit(0);
+        task.add_step_default(|| async { Ok(Success) });
+        task.init();
+
+        let shared = TaskShared::new(task.history_limit);
+        run_once(&mut task, &shared).await;
+
+        assert!(shared.history.lock().unwrap().is_empty());
+        assert_eq!(shared.runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// The observable state types round-trip through serde. (Layer 0, `serde` feature)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_observability_types() {
+        let step = StepState {
+            index: 0,
+            description: Some("s".to_string()),
+            status: StepStatus::Succeeded,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        assert_eq!(serde_json::from_str::<StepState>(&json).unwrap(), step);
+
+        let status = Status::Scheduled;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), status);
+
+        let record = RunRecord {
+            run_id: 3,
+            started_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            finished_at: Some(Utc.timestamp_opt(1_700_000_001, 0).unwrap()),
+            outcome: Some(RunOutcome::HadErrors),
+            attempts: 2,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(serde_json::from_str::<RunRecord>(&json).unwrap(), record);
     }
 }
