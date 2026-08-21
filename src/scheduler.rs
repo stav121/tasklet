@@ -1,6 +1,8 @@
 use crate::errors::{TaskError, TaskResult};
 use crate::generator::TaskGenerator;
-use crate::task::{run_task, OverlapPolicy, Status, Task, TaskCmd, TaskShared};
+use crate::task::{
+    run_task, OverlapPolicy, RunOutcome, RunRecord, Status, StepState, Task, TaskCmd, TaskShared,
+};
 use crate::{scheduler_log, task_log};
 use chrono::prelude::*;
 use chrono::Utc;
@@ -19,26 +21,75 @@ use tokio::task::JoinHandle;
 #[derive(Debug)]
 pub struct TaskHandle {
     id: usize,
+    name: Option<String>,
     handle: JoinHandle<()>,
     sender: mpsc::Sender<TaskCmd>,
     shared: Arc<TaskShared>,
     overlap: OverlapPolicy,
 }
 
+/// A cheaply-clonable entry shared with [`SchedulerHandle`] so it can observe and
+/// control a task without touching the scheduler-private join handle. Rebuilt from the
+/// live task set at the end of every scheduler round.
+#[derive(Clone, Debug)]
+struct RegEntry {
+    id: usize,
+    name: Option<String>,
+    sender: mpsc::Sender<TaskCmd>,
+    shared: Arc<TaskShared>,
+}
+
+impl RegEntry {
+    /// Compute a point-in-time [`TaskState`] snapshot from the shared cell.
+    fn to_state(&self) -> TaskState {
+        let (status, next_exec) = {
+            let state = self.shared.state.lock().unwrap();
+            (state.status.clone(), state.next_exec)
+        };
+        let last_outcome = self
+            .shared
+            .history
+            .lock()
+            .unwrap()
+            .back()
+            .and_then(|r| r.outcome.clone());
+        TaskState {
+            id: self.id,
+            name: self.name.clone(),
+            status,
+            next_exec,
+            running: self.shared.running.load(Ordering::SeqCst),
+            paused: self.shared.paused.load(Ordering::SeqCst),
+            last_outcome,
+            run_count: self.shared.runs.load(Ordering::SeqCst),
+        }
+    }
+}
+
 /// A snapshot of a single task's state, as reported by [`SchedulerHandle`].
 ///
-/// This is a read-only view refreshed at the end of every scheduler round.
+/// This is a read-only view computed from the task's live shared state, refreshed at
+/// the end of every scheduler round.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct TaskState {
     /// The task's id, as assigned by the scheduler.
     pub id: usize,
+    /// The task's unique name, if one was set via [`TaskBuilder::name`](crate::TaskBuilder::name).
+    pub name: Option<String>,
     /// The task's lifecycle status as of the last completed round.
     pub status: Status,
     /// The task's next execution time, normalized to UTC (`None` if not scheduled).
     pub next_exec: Option<DateTime<Utc>>,
     /// Whether a run of this task is currently in progress.
     pub running: bool,
+    /// Whether the task is currently paused (its schedule is not dispatched).
+    pub paused: bool,
+    /// The outcome of the most recent completed run, if any.
+    pub last_outcome: Option<RunOutcome>,
+    /// The total number of runs started over the task's lifetime.
+    pub run_count: usize,
 }
 
 /// A cloneable handle used to control and observe a running [`TaskScheduler`].
@@ -68,7 +119,7 @@ pub struct TaskState {
 #[derive(Clone, Debug)]
 pub struct SchedulerHandle {
     notify: Arc<Notify>,
-    status: Arc<Mutex<Vec<TaskState>>>,
+    registry: Arc<Mutex<Vec<RegEntry>>>,
 }
 
 impl SchedulerHandle {
@@ -88,22 +139,151 @@ impl SchedulerHandle {
     ///
     /// The value reflects the most recently completed round.
     pub fn task_count(&self) -> usize {
-        self.status.lock().unwrap().len()
+        self.registry.lock().unwrap().len()
     }
 
     /// A snapshot of every live task's [`TaskState`], as of the last completed round.
     pub fn statuses(&self) -> Vec<TaskState> {
-        self.status.lock().unwrap().clone()
+        self.registry
+            .lock()
+            .unwrap()
+            .iter()
+            .map(RegEntry::to_state)
+            .collect()
+    }
+
+    /// The full [`TaskState`] of the task with the given id, if it is still registered.
+    pub fn state_of(&self, id: usize) -> Option<TaskState> {
+        self.registry
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == id)
+            .map(RegEntry::to_state)
     }
 
     /// The [`Status`] of the task with the given id, if it is still registered.
     pub fn status_of(&self, id: usize) -> Option<Status> {
-        self.status
+        self.state_of(id).map(|s| s.status)
+    }
+
+    /// The id of the task registered under the given name, if any.
+    pub fn id_of_name(&self, name: &str) -> Option<usize> {
+        self.registry
             .lock()
             .unwrap()
             .iter()
-            .find(|t| t.id == id)
-            .map(|t| t.status.clone())
+            .find(|e| e.name.as_deref() == Some(name))
+            .map(|e| e.id)
+    }
+
+    /// The [`Status`] of the task registered under the given name, if any.
+    pub fn status_of_name(&self, name: &str) -> Option<Status> {
+        self.id_of_name(name).and_then(|id| self.status_of(id))
+    }
+
+    /// The recent [`RunRecord`] history of the task with the given id, oldest first.
+    ///
+    /// Returns an empty vector if the task is unknown or has no retained history.
+    pub fn history(&self, id: usize) -> Vec<RunRecord> {
+        self.registry
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.shared.history.lock().unwrap().iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The per-step state of the last completed run of the task with the given id.
+    ///
+    /// Returns an empty vector if the task is unknown.
+    pub fn step_states(&self, id: usize) -> Vec<StepState> {
+        self.registry
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.shared.steps.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+
+    /// Pause the task with the given id: its schedule stops being dispatched until
+    /// [`resume`](Self::resume) is called. A run already in progress is not interrupted.
+    ///
+    /// Returns `true` if the task was found.
+    pub fn pause(&self, id: usize) -> bool {
+        self.with_entry(id, |e| e.shared.paused.store(true, Ordering::SeqCst))
+    }
+
+    /// Resume a paused task so its schedule is dispatched again. Returns `true` if the
+    /// task was found.
+    pub fn resume(&self, id: usize) -> bool {
+        self.with_entry(id, |e| e.shared.paused.store(false, Ordering::SeqCst))
+    }
+
+    /// Trigger an immediate run of the task with the given id, regardless of its
+    /// schedule. If a run is already in progress, the trigger is queued to run once the
+    /// current run finishes (at most one queued). Returns `true` if the task was found.
+    pub fn trigger(&self, id: usize) -> bool {
+        self.with_entry(id, |e| {
+            if e.shared.running.load(Ordering::SeqCst) {
+                e.shared.pending.store(true, Ordering::SeqCst);
+            } else {
+                // Fire-and-forget; a full channel means a run is already queued.
+                let _ = e.sender.try_send(TaskCmd::Run);
+            }
+        })
+    }
+
+    /// Request removal of the task with the given id. The scheduler reaps it on its
+    /// next round. Returns `true` if the task was found.
+    pub fn remove(&self, id: usize) -> bool {
+        self.with_entry(id, |e| {
+            e.shared.remove_requested.store(true, Ordering::SeqCst)
+        })
+    }
+
+    /// Pause the task registered under the given name. Returns `true` if found.
+    pub fn pause_name(&self, name: &str) -> bool {
+        self.id_of_name(name)
+            .map(|id| self.pause(id))
+            .unwrap_or(false)
+    }
+
+    /// Resume the task registered under the given name. Returns `true` if found.
+    pub fn resume_name(&self, name: &str) -> bool {
+        self.id_of_name(name)
+            .map(|id| self.resume(id))
+            .unwrap_or(false)
+    }
+
+    /// Trigger the task registered under the given name. Returns `true` if found.
+    pub fn trigger_name(&self, name: &str) -> bool {
+        self.id_of_name(name)
+            .map(|id| self.trigger(id))
+            .unwrap_or(false)
+    }
+
+    /// Request removal of the task registered under the given name. Returns `true` if found.
+    pub fn remove_name(&self, name: &str) -> bool {
+        self.id_of_name(name)
+            .map(|id| self.remove(id))
+            .unwrap_or(false)
+    }
+
+    /// Run `f` against the entry with the given id, if present. Returns whether it was found.
+    fn with_entry<F>(&self, id: usize, f: F) -> bool
+    where
+        F: FnOnce(&RegEntry),
+    {
+        match self.registry.lock().unwrap().iter().find(|e| e.id == id) {
+            Some(entry) => {
+                f(entry);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -124,9 +304,9 @@ where
     timezone: T,
     /// Notified when a graceful shutdown is requested.
     shutdown: Arc<Notify>,
-    /// Snapshot of the live tasks' states, refreshed each round and read by
+    /// The observable/controllable registry, rebuilt each round and shared with every
     /// [`SchedulerHandle`].
-    status: Arc<Mutex<Vec<TaskState>>>,
+    registry: Arc<Mutex<Vec<RegEntry>>>,
 }
 
 /// `TaskScheduler` implementation.
@@ -156,7 +336,7 @@ where
             timezone,
             next_id: 0,
             shutdown: Arc::new(Notify::new()),
-            status: Arc::new(Mutex::new(Vec::new())),
+            registry: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -172,7 +352,7 @@ where
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle {
             notify: self.shutdown.clone(),
-            status: self.status.clone(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -223,6 +403,10 @@ where
     ///
     /// * task - a `Task` instance.
     ///
+    /// If the task has a name (set via [`TaskBuilder::name`](crate::TaskBuilder::name)),
+    /// it must be unique within the scheduler; a duplicate is rejected with
+    /// [`TaskError::DuplicateTaskName`].
+    ///
     /// # Examples
     ///
     /// ```
@@ -240,6 +424,13 @@ where
     ) -> Result<&mut TaskScheduler<T>, TaskError> {
         match task {
             Ok(mut task) => {
+                // Enforce name uniqueness so a name is a stable, addressable identity.
+                if let Some(name) = task.name.as_deref() {
+                    if self.handles.iter().any(|h| h.name.as_deref() == Some(name)) {
+                        return Err(TaskError::DuplicateTaskName(name.to_string()));
+                    }
+                }
+
                 // A buffer of one is enough: the scheduler only dispatches a run when
                 // the task is idle, so at most one `Run` is ever in flight.
                 let (sender, receiver) = mpsc::channel(1);
@@ -247,12 +438,14 @@ where
                 task.set_receiver(receiver);
                 task.set_id(self.next_id);
                 let overlap = task.overlap;
-                let shared = Arc::new(TaskShared::new());
+                let name = task.name.clone();
+                let shared = Arc::new(TaskShared::new(task.history_limit));
                 let handle = tokio::spawn(run_task(task, shared.clone()));
 
                 // Push the handle
                 self.handles.push(TaskHandle {
                     id: self.next_id,
+                    name,
                     handle,
                     sender,
                     shared,
@@ -277,10 +470,17 @@ where
     fn dispatch_round(&mut self) {
         let now = Utc::now();
 
-        // Reap tasks that have reached a terminal state and published `finished`.
+        // Reap tasks that have reached a terminal state or been removed on request.
         self.handles.retain(|handle| {
-            if handle.shared.finished.load(Ordering::SeqCst) {
-                task_log!(handle.id, log::Level::Debug, "Removing finished task");
+            let finished = handle.shared.finished.load(Ordering::SeqCst);
+            let removed = handle.shared.remove_requested.load(Ordering::SeqCst);
+            if finished || removed {
+                let reason = if removed {
+                    "Removing task on request"
+                } else {
+                    "Removing finished task"
+                };
+                task_log!(handle.id, log::Level::Debug, "{}", reason);
                 handle.handle.abort();
                 false
             } else {
@@ -290,6 +490,11 @@ where
 
         // Dispatch due tasks.
         for handle in &self.handles {
+            // A paused task's schedule is not dispatched.
+            if handle.shared.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+
             let due = match handle.shared.state.lock().unwrap().next_exec {
                 Some(next) => now >= next,
                 None => false,
@@ -314,25 +519,23 @@ where
             }
         }
 
-        self.refresh_status();
+        self.refresh_registry();
     }
 
-    /// Refresh the observable status snapshot from every live task's shared state.
-    fn refresh_status(&self) {
+    /// Rebuild the shared registry from the live task set so every [`SchedulerHandle`]
+    /// observes and controls the current tasks.
+    fn refresh_registry(&self) {
         let snapshot = self
             .handles
             .iter()
-            .map(|handle| {
-                let state = handle.shared.state.lock().unwrap();
-                TaskState {
-                    id: handle.id,
-                    status: state.status.clone(),
-                    next_exec: state.next_exec,
-                    running: handle.shared.running.load(Ordering::SeqCst),
-                }
+            .map(|handle| RegEntry {
+                id: handle.id,
+                name: handle.name.clone(),
+                sender: handle.sender.clone(),
+                shared: handle.shared.clone(),
             })
             .collect();
-        *self.status.lock().unwrap() = snapshot;
+        *self.registry.lock().unwrap() = snapshot;
     }
 
     /// Execute the `TaskGenerator` instance (if set).
@@ -366,6 +569,7 @@ where
             handle.handle.abort();
         }
         self.handles.clear();
+        self.registry.lock().unwrap().clear();
     }
 
     /// Run one iteration of the scheduler flow: run the generator (if due) and
@@ -468,6 +672,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::task::StepStatus;
     use crate::task::TaskStepStatusErr::ErrorDelete;
     use crate::task::TaskStepStatusOk::Success;
     use crate::TaskBuilder;
@@ -860,5 +1065,218 @@ mod test {
 
         assert_eq!(observed.load(Ordering::SeqCst), 0);
         assert_eq!(handle.status_of(0), None);
+    }
+
+    /// A duplicate task name is rejected. (Layer 0)
+    #[tokio::test]
+    async fn test_add_task_rejects_duplicate_name() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        let t1 = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("dup")
+            .build();
+        let t2 = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("dup")
+            .build();
+        scheduler.add_task(t1).unwrap();
+        match scheduler.add_task(t2) {
+            Err(TaskError::DuplicateTaskName(name)) => assert_eq!(name, "dup"),
+            _ => panic!("expected DuplicateTaskName error"),
+        }
+        // A different name is accepted.
+        let t3 = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("other")
+            .build();
+        assert!(scheduler.add_task(t3).is_ok());
+    }
+
+    /// Pausing a task stops its schedule from being dispatched; resuming restores it. (Layer 0)
+    #[tokio::test]
+    async fn test_control_pause_and_resume() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Populate the registry so the handle can address the task.
+        scheduler.dispatch_round();
+
+        let handle = scheduler.handle();
+        assert!(handle.pause(0));
+
+        // Force the task due and dispatch: a paused task must not run.
+        scheduler.handles[0].shared.state.lock().unwrap().next_exec =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+        scheduler.dispatch_round();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "paused task must not run"
+        );
+        assert!(handle.state_of(0).unwrap().paused);
+
+        // Resume and dispatch: the task runs.
+        assert!(handle.resume(0));
+        scheduler.handles[0].shared.state.lock().unwrap().next_exec =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+        scheduler.dispatch_round();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "resumed task should run");
+    }
+
+    /// Triggering runs an idle task immediately, regardless of its schedule. (Layer 0)
+    #[tokio::test]
+    async fn test_control_trigger_runs_idle_task() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Populate the registry; the task is not due for ~1s.
+        scheduler.dispatch_round();
+
+        let handle = scheduler.handle();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert!(handle.trigger(0));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "trigger should run the task now"
+        );
+        // Triggering an unknown id reports not-found.
+        assert!(!handle.trigger(99));
+    }
+
+    /// Requesting removal reaps the task on the next round. (Layer 0)
+    #[tokio::test]
+    async fn test_control_remove_reaps_task() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        scheduler.dispatch_round();
+
+        let handle = scheduler.handle();
+        assert_eq!(handle.task_count(), 1);
+        assert!(handle.remove(0));
+        // Next round reaps it.
+        scheduler.dispatch_round();
+        assert_eq!(scheduler.handles.len(), 0);
+        assert_eq!(handle.task_count(), 0);
+        assert!(!handle.remove(0));
+    }
+
+    /// The handle resolves names and exposes run history and step states. (Layer 0)
+    #[tokio::test]
+    async fn test_handle_name_history_and_steps() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let c = counter.clone();
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("worker")
+            .add_step("do work", move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(Success)
+                }
+            })
+            .build();
+        scheduler.add_task(task).unwrap();
+
+        let probe = scheduler.handle();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            let id = probe.id_of_name("worker");
+            let status = probe.status_of_name("worker");
+            let history = id.map(|i| probe.history(i)).unwrap_or_default();
+            let steps = id.map(|i| probe.step_states(i)).unwrap_or_default();
+            (id, status, history, steps)
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until(tokio::time::sleep(Duration::from_millis(2000))),
+        )
+        .await
+        .expect("scheduler did not stop");
+        let (id, status, history, steps) = observer.await.unwrap();
+
+        assert_eq!(id, Some(0));
+        assert!(status.is_some());
+        assert!(!history.is_empty(), "history should have records");
+        assert!(history
+            .iter()
+            .any(|r| r.outcome == Some(RunOutcome::Success)));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].description.as_deref(), Some("do work"));
+        assert_eq!(steps[0].status, StepStatus::Succeeded);
+        assert!(counter.load(Ordering::SeqCst) >= 1);
+        // Unknown name resolves to nothing.
+        assert_eq!(scheduler.handle().id_of_name("nope"), None);
+    }
+
+    /// `TaskState` carries the new observable fields (name, run_count, last_outcome). (Layer 0)
+    #[tokio::test]
+    async fn test_task_state_exposes_new_fields() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let c = counter.clone();
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("named")
+            .add_step_default(move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(Success)
+                }
+            })
+            .build();
+        scheduler.add_task(task).unwrap();
+
+        let probe = scheduler.handle();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            probe.state_of(0)
+        });
+
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2000)))
+            .await;
+        let state = observer.await.unwrap().expect("state should exist");
+
+        assert_eq!(state.name.as_deref(), Some("named"));
+        assert!(state.run_count >= 1);
+        assert_eq!(state.last_outcome, Some(RunOutcome::Success));
+        assert!(!state.paused);
+    }
+
+    /// `TaskState` round-trips through serde. (Layer 0, `serde` feature)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_task_state() {
+        let state = TaskState {
+            id: 1,
+            name: Some("t".to_string()),
+            status: Status::Scheduled,
+            next_exec: None,
+            running: false,
+            paused: true,
+            last_outcome: Some(RunOutcome::Success),
+            run_count: 5,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TaskState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 1);
+        assert_eq!(back.name.as_deref(), Some("t"));
+        assert_eq!(back.status, Status::Scheduled);
+        assert!(back.paused);
+        assert_eq!(back.last_outcome, Some(RunOutcome::Success));
+        assert_eq!(back.run_count, 5);
     }
 }

@@ -19,7 +19,13 @@
 //!   happens when a run overruns its interval with an [`OverlapPolicy`] via
 //!   [`TaskBuilder::overlap`].
 //! * **Observability** — query the live task set at runtime through
-//!   [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`].
+//!   [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`], including per-task
+//!   run history ([`SchedulerHandle::history`]) and per-step state
+//!   ([`SchedulerHandle::step_states`]).
+//! * **Runtime control** — name a task with [`TaskBuilder::name`] and pause, resume,
+//!   trigger or remove it at runtime through a [`SchedulerHandle`], by id or by name.
+//! * **Shared data** — pass values between tasks and steps with a cheaply-clonable,
+//!   typed [`Blackboard`].
 //!
 //! # Example
 //!
@@ -41,6 +47,7 @@
 //! }
 //! ```
 
+mod blackboard;
 mod builders;
 pub mod errors;
 mod generator;
@@ -48,12 +55,13 @@ pub mod retry;
 mod scheduler;
 pub mod task;
 
+pub use blackboard::Blackboard;
 pub use builders::TaskBuilder;
 pub use errors::{TaskError, TaskResult};
 pub use generator::TaskGenerator;
 pub use retry::{Backoff, Jitter, RetryPolicy};
 pub use scheduler::{SchedulerHandle, TaskScheduler, TaskState};
-pub use task::{OverlapPolicy, Status, Task};
+pub use task::{OverlapPolicy, RunOutcome, RunRecord, Status, StepState, StepStatus, Task};
 
 /// Macro for consistent task-related logging
 ///

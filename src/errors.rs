@@ -29,6 +29,10 @@ pub enum TaskError {
     #[error("Invalid cron expression: {0}")]
     InvalidCronExpression(String),
 
+    /// A task with the same name is already registered with the scheduler.
+    #[error("A task named '{0}' is already registered")]
+    DuplicateTaskName(String),
+
     /// A required component is missing.
     #[error("Missing required component: {0}")]
     MissingComponent(String),
