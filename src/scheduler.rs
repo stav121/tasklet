@@ -422,42 +422,68 @@ where
         &mut self,
         task: TaskResult<Task<T>>,
     ) -> Result<&mut TaskScheduler<T>, TaskError> {
-        match task {
-            Ok(mut task) => {
-                // Enforce name uniqueness so a name is a stable, addressable identity.
-                if let Some(name) = task.name.as_deref() {
-                    if self.handles.iter().any(|h| h.name.as_deref() == Some(name)) {
-                        return Err(TaskError::DuplicateTaskName(name.to_string()));
-                    }
-                }
+        self.add_task_get_id(task)?;
+        Ok(self)
+    }
 
-                // A buffer of one is enough: the scheduler only dispatches a run when
-                // the task is idle, so at most one `Run` is ever in flight.
-                let (sender, receiver) = mpsc::channel(1);
+    /// Add a new task and return the id the scheduler assigned to it.
+    ///
+    /// This is the same as [`add_task`](Self::add_task) except it returns the new
+    /// task's id instead of `&mut Self`, so callers can address an unnamed task
+    /// afterwards through a [`SchedulerHandle`] (pause, resume, trigger, remove).
+    ///
+    /// If the task has a name (set via [`TaskBuilder::name`](crate::TaskBuilder::name)),
+    /// it must be unique within the scheduler; a duplicate is rejected with
+    /// [`TaskError::DuplicateTaskName`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::{TaskScheduler, Task};
+    /// # tokio_test::block_on( async {
+    /// let mut scheduler = TaskScheduler::default(chrono::Local);
+    /// let id = scheduler
+    ///     .add_task_get_id(Task::new("* * * * * * *", None, None, chrono::Local))
+    ///     .unwrap();
+    /// assert_eq!(id, 0);
+    /// # });
+    /// ```
+    pub fn add_task_get_id(&mut self, task: TaskResult<Task<T>>) -> Result<usize, TaskError> {
+        let mut task = task?;
 
-                task.set_receiver(receiver);
-                task.set_id(self.next_id);
-                let overlap = task.overlap;
-                let name = task.name.clone();
-                let shared = Arc::new(TaskShared::new(task.history_limit));
-                let handle = tokio::spawn(run_task(task, shared.clone()));
-
-                // Push the handle
-                self.handles.push(TaskHandle {
-                    id: self.next_id,
-                    name,
-                    handle,
-                    sender,
-                    shared,
-                    overlap,
-                });
-
-                // Increase the id of the next task.
-                self.next_id += 1;
-                Ok(self)
+        // Enforce name uniqueness so a name is a stable, addressable identity.
+        if let Some(name) = task.name.as_deref() {
+            if self.handles.iter().any(|h| h.name.as_deref() == Some(name)) {
+                return Err(TaskError::DuplicateTaskName(name.to_string()));
             }
-            Err(e) => Err(e),
         }
+
+        let id = self.next_id;
+
+        // A buffer of one is enough: the scheduler only dispatches a run when
+        // the task is idle, so at most one `Run` is ever in flight.
+        let (sender, receiver) = mpsc::channel(1);
+
+        task.set_receiver(receiver);
+        task.set_id(id);
+        let overlap = task.overlap;
+        let name = task.name.clone();
+        let shared = Arc::new(TaskShared::new(task.history_limit));
+        let handle = tokio::spawn(run_task(task, shared.clone()));
+
+        // Push the handle
+        self.handles.push(TaskHandle {
+            id,
+            name,
+            handle,
+            sender,
+            shared,
+            overlap,
+        });
+
+        // Increase the id of the next task.
+        self.next_id += 1;
+        Ok(id)
     }
 
     /// Run a single scheduling round.
@@ -1090,6 +1116,40 @@ mod test {
             .name("other")
             .build();
         assert!(scheduler.add_task(t3).is_ok());
+    }
+
+    /// `add_task_get_id` returns the assigned id and still enforces name uniqueness. (§4.1)
+    #[tokio::test]
+    async fn test_add_task_get_id_returns_ids() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        let id0 = scheduler
+            .add_task_get_id(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        let id1 = scheduler
+            .add_task_get_id(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+
+        // A propagated build error surfaces rather than assigning an id.
+        assert!(scheduler
+            .add_task_get_id(Task::new("not a cron", None, None, Local))
+            .is_err());
+
+        // Duplicate names are still rejected.
+        let named = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("solo")
+            .build();
+        assert_eq!(scheduler.add_task_get_id(named).unwrap(), 2);
+        let dup = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .name("solo")
+            .build();
+        assert!(matches!(
+            scheduler.add_task_get_id(dup),
+            Err(TaskError::DuplicateTaskName(_))
+        ));
     }
 
     /// Pausing a task stops its schedule from being dispatched; resuming restores it. (Layer 0)

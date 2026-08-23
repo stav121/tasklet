@@ -176,6 +176,88 @@ where
         self
     }
 
+    /// Run every `n` seconds.
+    ///
+    /// A convenience wrapper over [`every`](Self::every) that builds the equivalent
+    /// cron expression, so you do not have to write one by hand. `n` must be between 1
+    /// and 59; other values produce an invalid schedule that is rejected by
+    /// [`build`](Self::build).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local).every_seconds(5).build().unwrap();
+    /// ```
+    pub fn every_seconds(self, n: u32) -> TaskBuilder<T> {
+        self.every(&format!("*/{} * * * * * *", n))
+    }
+
+    /// Run every `n` minutes (at second 0).
+    ///
+    /// A convenience wrapper over [`every`](Self::every). `n` must be between 1 and 59;
+    /// other values produce an invalid schedule that is rejected by
+    /// [`build`](Self::build).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local).every_minutes(15).build().unwrap();
+    /// ```
+    pub fn every_minutes(self, n: u32) -> TaskBuilder<T> {
+        self.every(&format!("0 */{} * * * * *", n))
+    }
+
+    /// Run every `n` hours (at minute 0, second 0).
+    ///
+    /// A convenience wrapper over [`every`](Self::every). `n` must be between 1 and 23;
+    /// other values produce an invalid schedule that is rejected by
+    /// [`build`](Self::build).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// let _task = TaskBuilder::new(chrono::Local).every_hours(6).build().unwrap();
+    /// ```
+    pub fn every_hours(self, n: u32) -> TaskBuilder<T> {
+        self.every(&format!("0 0 */{} * * * *", n))
+    }
+
+    /// Run once a day at the given `hour` and `minute` (24-hour clock, second 0).
+    ///
+    /// A convenience wrapper over [`every`](Self::every). `hour` must be 0-23 and
+    /// `minute` 0-59; other values produce an invalid schedule that is rejected by
+    /// [`build`](Self::build). The time is interpreted in the builder's timezone.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// // Every day at 09:30.
+    /// let _task = TaskBuilder::new(chrono::Local).daily_at(9, 30).build().unwrap();
+    /// ```
+    pub fn daily_at(self, hour: u32, minute: u32) -> TaskBuilder<T> {
+        self.every(&format!("0 {} {} * * * *", minute, hour))
+    }
+
+    /// Run once an hour at the given `minute` (second 0).
+    ///
+    /// A convenience wrapper over [`every`](Self::every). `minute` must be 0-59; other
+    /// values produce an invalid schedule that is rejected by [`build`](Self::build).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::TaskBuilder;
+    /// // At minute 15 of every hour.
+    /// let _task = TaskBuilder::new(chrono::Local).hourly_at(15).build().unwrap();
+    /// ```
+    pub fn hourly_at(self, minute: u32) -> TaskBuilder<T> {
+        self.every(&format!("0 {} * * * * *", minute))
+    }
+
     /// Set the max repeats for the generated `Task`.
     ///
     /// # Arguments
@@ -599,5 +681,46 @@ mod test {
             .unwrap();
         assert_eq!(task.history_limit, DEFAULT_HISTORY_LIMIT);
         assert!(task.name.is_none());
+    }
+
+    /// The schedule-helper builders produce valid, buildable cron expressions. (E1)
+    #[test]
+    fn test_schedule_helpers_build_valid_expressions() {
+        let cases = [
+            (
+                TaskBuilder::new(chrono::Utc).every_seconds(5),
+                "*/5 * * * * * *",
+            ),
+            (
+                TaskBuilder::new(chrono::Utc).every_minutes(15),
+                "0 */15 * * * * *",
+            ),
+            (
+                TaskBuilder::new(chrono::Utc).every_hours(6),
+                "0 0 */6 * * * *",
+            ),
+            (
+                TaskBuilder::new(chrono::Utc).daily_at(9, 30),
+                "0 30 9 * * * *",
+            ),
+            (
+                TaskBuilder::new(chrono::Utc).hourly_at(15),
+                "0 15 * * * * *",
+            ),
+        ];
+        for (builder, expected) in cases {
+            assert_eq!(builder.expression, expected);
+            // The helper parsed the expression eagerly, and it builds.
+            assert!(builder.schedule.is_some());
+            assert!(builder.build().is_ok());
+        }
+    }
+
+    /// A schedule helper given an out-of-range value fails at build time. (E1)
+    #[test]
+    fn test_schedule_helper_invalid_value_rejected() {
+        // Second 60 is out of range, so the generated expression is invalid.
+        let result = TaskBuilder::new(chrono::Utc).every_seconds(60).build();
+        assert!(matches!(result, Err(TaskError::InvalidCronExpression(_))));
     }
 }

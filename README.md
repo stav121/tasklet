@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.4.0"
+tasklet = "0.4.1"
 ```
 
 To derive `serde` on the observable state types (`TaskState`, `Status`, `RunRecord`,
@@ -42,7 +42,7 @@ To derive `serde` on the observable state types (`TaskState`, `Status`, `RunReco
 
 ```
 [dependencies]
-tasklet = { version = "0.4.0", features = ["serde"] }
+tasklet = { version = "0.4.1", features = ["serde"] }
 ```
 
 > **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
@@ -210,6 +210,43 @@ for state in handle.statuses() {
 ```
 
 See [`examples/overlap_and_status_example.rs`](/examples/overlap_and_status_example.rs) for a runnable demo.
+
+Since 0.4.1, `handle.step_states(id)` reflects step transitions *live* during a run, not
+only after it finishes: a completed early step shows as `Succeeded` while a later step is
+still `Pending`.
+
+## Schedule helpers
+
+Since 0.4.1 you can express common cadences without writing cron by hand. Each helper is a
+thin wrapper over `every(...)`:
+
+```rust,no_run
+# use tasklet::TaskBuilder;
+let _ = TaskBuilder::new(chrono::Local).every_seconds(5);   // "*/5 * * * * * *"
+let _ = TaskBuilder::new(chrono::Local).every_minutes(15);  // "0 */15 * * * * *"
+let _ = TaskBuilder::new(chrono::Local).every_hours(6);     // "0 0 */6 * * * *"
+let _ = TaskBuilder::new(chrono::Local).hourly_at(15);      // minute 15 of every hour
+let _ = TaskBuilder::new(chrono::Local).daily_at(9, 30);    // every day at 09:30
+```
+
+Out-of-range values (e.g. `every_seconds(60)`) produce an invalid schedule that is
+rejected by `build()`, just like an invalid cron string.
+
+You can also capture the id the scheduler assigns to a task with `add_task_get_id`, which
+is handy for addressing an unnamed task through the handle afterwards:
+
+```rust,no_run
+# use tasklet::{TaskBuilder, TaskScheduler};
+# #[tokio::main]
+# async fn main() {
+let mut scheduler = TaskScheduler::default(chrono::Local);
+let id = scheduler
+    .add_task_get_id(TaskBuilder::new(chrono::Local).every_seconds(5).build())
+    .unwrap();
+let handle = scheduler.handle();
+tokio::spawn(async move { handle.trigger(id); });
+# }
+```
 
 ## Naming, runtime control and history
 
