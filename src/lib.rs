@@ -21,7 +21,12 @@
 //! * **Observability** — query the live task set at runtime through
 //!   [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`], including per-task
 //!   run history ([`SchedulerHandle::history`]) and per-step state
-//!   ([`SchedulerHandle::step_states`]).
+//!   ([`SchedulerHandle::step_states`]), which streams step transitions live during a run.
+//! * **Schedule helpers** — build common cadences without raw cron:
+//!   [`TaskBuilder::every_seconds`], [`every_minutes`](TaskBuilder::every_minutes),
+//!   [`every_hours`](TaskBuilder::every_hours), [`hourly_at`](TaskBuilder::hourly_at) and
+//!   [`daily_at`](TaskBuilder::daily_at). Capture a task's id with
+//!   [`TaskScheduler::add_task_get_id`].
 //! * **Runtime control** — name a task with [`TaskBuilder::name`] and pause, resume,
 //!   trigger or remove it at runtime through a [`SchedulerHandle`], by id or by name.
 //! * **Shared data** — pass values between tasks and steps with a cheaply-clonable,

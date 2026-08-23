@@ -359,6 +359,11 @@ where
     pub(crate) task_id: usize,
     /// (Internal) per-step state of the last run, republished after every run.
     pub(crate) step_states: Vec<StepState>,
+    /// (Internal) shared cell to publish step-state transitions to as they happen, so
+    /// observers see live progress within a run rather than only the final snapshot.
+    /// Set by the scheduler when the task is spawned; `None` when the task is driven
+    /// directly (e.g. in unit tests), in which case streaming is a no-op.
+    pub(crate) step_sink: Option<Arc<TaskShared>>,
     /// (Internal) total step attempts made during the last run.
     pub(crate) last_attempts: usize,
     /// The maximum number of run records retained for this task.
@@ -449,6 +454,7 @@ where
             timezone,
             task_id: 0,
             step_states: Vec::new(),
+            step_sink: None,
             last_attempts: 0,
             history_limit: DEFAULT_HISTORY_LIMIT,
             status: Status::default(),
@@ -583,6 +589,14 @@ where
             .collect();
     }
 
+    /// Publish the current per-step snapshot to the shared cell, if a sink is set, so
+    /// observers see step transitions live during a run. A no-op when no sink is set.
+    fn publish_steps(&self) {
+        if let Some(shared) = &self.step_sink {
+            *shared.steps.lock().unwrap() = self.step_states.clone();
+        }
+    }
+
     /// Set the callbacks invoked over the task's lifecycle.
     pub(crate) fn set_callbacks(
         &mut self,
@@ -713,12 +727,19 @@ where
                 // Rebuild the per-step snapshot for this run and reset the attempt count.
                 self.reset_step_states();
                 self.last_attempts = 0;
+                // Stream the fresh (all-pending) snapshot so observers see the run begin.
+                self.publish_steps();
 
                 let mut had_error: bool = false;
-                for (index, step) in self.steps.iter_mut().enumerate() {
+                // Iterate by index so `self` is free between step invocations, letting us
+                // stream each transition to the shared cell as it happens.
+                for index in 0..self.steps.len() {
                     if had_error {
                         break;
                     }
+                    // The description is fixed per step; capture it for logging so we do
+                    // not hold a borrow of `self.steps` across the awaited step future.
+                    let step_desc = self.steps[index].to_string();
                     // Attempt the step, retrying transient (`Error`) failures and
                     // timeouts according to the retry policy. `ErrorDelete` and
                     // success both terminate the attempt loop immediately.
@@ -728,10 +749,15 @@ where
                         self.last_attempts += 1;
 
                         // Run the step, optionally bounded by the configured timeout.
-                        // A timeout is treated as a (retryable) `Error`.
+                        // A timeout is treated as a (retryable) `Error`. Producing the
+                        // step future borrows `self.steps[index]` only until it returns;
+                        // the boxed future is `'static`, so no borrow is held across the
+                        // await and `self` is free afterwards.
                         let result = match timeout {
                             Some(duration) => {
-                                match tokio::time::timeout(duration, (step.function)()).await {
+                                match tokio::time::timeout(duration, (self.steps[index].function)())
+                                    .await
+                                {
                                     Ok(result) => result,
                                     Err(_) => {
                                         step_log!(
@@ -740,13 +766,13 @@ where
                                             log::Level::Warn,
                                             "Timed out after {:?} - {}",
                                             duration,
-                                            step
+                                            step_desc
                                         );
                                         Err(TaskStepStatusErr::Error)
                                     }
                                 }
                             }
-                            None => (step.function)().await,
+                            None => (self.steps[index].function)().await,
                         };
 
                         match result {
@@ -758,7 +784,7 @@ where
                                             index,
                                             log::Level::Debug,
                                             "Executed successfully - {}",
-                                            step
+                                            step_desc
                                         );
                                         self.step_states[index].status = StepStatus::Succeeded;
                                     }
@@ -768,12 +794,13 @@ where
                                             index,
                                             log::Level::Debug,
                                             "Executed with non-fatal errors - {}",
-                                            step
+                                            step_desc
                                         );
                                         self.step_states[index].status = StepStatus::HadErrors;
                                     }
                                 }
                                 self.status = Status::Executed;
+                                self.publish_steps();
                                 break;
                             }
                             Err(TaskStepStatusErr::ErrorDelete) => {
@@ -782,10 +809,11 @@ where
                                     index,
                                     log::Level::Error,
                                     "Execution failed and task is marked for deletion - {}",
-                                    step
+                                    step_desc
                                 );
                                 self.step_states[index].status = StepStatus::Failed;
                                 self.status = Status::ForceRemoved;
+                                self.publish_steps();
                                 had_error = true;
                                 break;
                             }
@@ -802,7 +830,7 @@ where
                                         attempt,
                                         max_attempts,
                                         delay,
-                                        step
+                                        step_desc
                                     );
                                     if !delay.is_zero() {
                                         tokio::time::sleep(delay).await;
@@ -814,10 +842,11 @@ where
                                     index,
                                     log::Level::Error,
                                     "Execution failed - {}",
-                                    step
+                                    step_desc
                                 );
                                 self.step_states[index].status = StepStatus::Failed;
                                 self.status = Status::Failed;
+                                self.publish_steps();
                                 had_error = true;
                                 break;
                             }
@@ -830,6 +859,8 @@ where
                         step_state.status = StepStatus::Skipped;
                     }
                 }
+                // Stream the final per-step outcome (including any skipped steps).
+                self.publish_steps();
                 // Avoid underflow in case of a task without steps.
                 if self.steps.is_empty() {
                     self.status = Status::Executed
@@ -944,7 +975,9 @@ where
     T: TimeZone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
-    // Self-initialize and publish the first scheduled time.
+    // Wire the shared cell as the step-state sink so step transitions stream live
+    // during each run, then self-initialize and publish the first scheduled time.
+    task.step_sink = Some(shared.clone());
     task.init();
     publish(&task, &shared);
     if task.is_terminal() {
@@ -1703,6 +1736,57 @@ mod test {
 
         assert!(shared.history.lock().unwrap().is_empty());
         assert_eq!(shared.runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Step-state transitions are streamed to the shared cell during a run, so an
+    /// observer sees a completed step while a later step is still pending. (§4.3)
+    #[tokio::test]
+    async fn test_step_states_stream_live() {
+        use tokio::sync::Notify;
+
+        let ready = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+
+        let (tx, rx) = mpsc::channel(1);
+        let mut task = Task::new("* * * * * * *", None, Some(1), Utc).unwrap();
+        task.set_id(0);
+        // Step 0 succeeds immediately.
+        task.add_step("first", || async { Ok(Success) });
+        // Step 1 signals that it has been reached, then waits for permission to finish.
+        let r = ready.clone();
+        let p = proceed.clone();
+        task.add_step("second", move || {
+            let r = r.clone();
+            let p = p.clone();
+            async move {
+                r.notify_one();
+                p.notified().await;
+                Ok(Success)
+            }
+        });
+        task.set_receiver(rx);
+
+        let shared = Arc::new(TaskShared::new(DEFAULT_HISTORY_LIMIT));
+        let join = tokio::spawn(run_task(task, shared.clone()));
+
+        // Dispatch a run and wait until step 1 is mid-flight.
+        tx.send(TaskCmd::Run).await.unwrap();
+        ready.notified().await;
+
+        // Live snapshot: step 0 already succeeded while step 1 is still pending.
+        {
+            let steps = shared.steps.lock().unwrap();
+            assert_eq!(steps[0].status, StepStatus::Succeeded);
+            assert_eq!(steps[1].status, StepStatus::Pending);
+        }
+
+        // Let step 1 finish; the run completes and, with repeat(1), the task retires.
+        proceed.notify_one();
+        join.await.unwrap();
+
+        let steps = shared.steps.lock().unwrap();
+        assert_eq!(steps[0].status, StepStatus::Succeeded);
+        assert_eq!(steps[1].status, StepStatus::Succeeded);
     }
 
     /// The observable state types round-trip through serde. (Layer 0, `serde` feature)
