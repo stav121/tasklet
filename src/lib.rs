@@ -8,6 +8,9 @@
 //!
 //! * **Async steps** — every task step is a closure returning a future, so steps can
 //!   `.await` real asynchronous work (I/O, timers, ...) without blocking the runtime.
+//!   Each step is handed a [`TaskContext`] identifying the run (task id/name, run id,
+//!   step index, attempt) and giving access to a task-level [`Blackboard`] plus a
+//!   per-run store for passing values between steps within a run.
 //! * **Graceful shutdown** — obtain a [`SchedulerHandle`] via
 //!   [`TaskScheduler::handle`] before running and call `shutdown()` to stop the scheduler
 //!   cleanly, or drive shutdown with any future via [`TaskScheduler::run_until`].
@@ -29,6 +32,8 @@
 //!   [`TaskScheduler::add_task_get_id`].
 //! * **Runtime control** — name a task with [`TaskBuilder::name`] and pause, resume,
 //!   trigger or remove it at runtime through a [`SchedulerHandle`], by id or by name.
+//!   Add tasks to a running scheduler with a [`TaskSpawner`] obtained from
+//!   [`TaskScheduler::spawner`].
 //! * **Shared data** — pass values between tasks and steps with a cheaply-clonable,
 //!   typed [`Blackboard`].
 //!
@@ -45,7 +50,7 @@
 //!         TaskBuilder::new(chrono::Local)
 //!             .every("1 * * * * * *")
 //!             .description("A simple task")
-//!             .add_step("Step 1", || async { Ok(Success) })
+//!             .add_step("Step 1", |_ctx| async { Ok(Success) })
 //!             .build(),
 //!     );
 //!     scheduler.run().await;
@@ -65,8 +70,10 @@ pub use builders::TaskBuilder;
 pub use errors::{TaskError, TaskResult};
 pub use generator::TaskGenerator;
 pub use retry::{Backoff, Jitter, RetryPolicy};
-pub use scheduler::{SchedulerHandle, TaskScheduler, TaskState};
-pub use task::{OverlapPolicy, RunOutcome, RunRecord, Status, StepState, StepStatus, Task};
+pub use scheduler::{SchedulerHandle, TaskScheduler, TaskSpawner, TaskState};
+pub use task::{
+    OverlapPolicy, RunOutcome, RunRecord, Status, StepState, StepStatus, Task, TaskContext,
+};
 
 /// Macro for consistent task-related logging
 ///

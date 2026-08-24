@@ -19,8 +19,8 @@ async fn main() {
             .every("* * * * * *")
             .description("Some description")
             .repeat(5)
-            .add_step("First step", || async { Ok(Success) })
-            .add_step("Second step", || async { Ok(Success) })
+            .add_step("First step", |_ctx| async { Ok(Success) })
+            .add_step("Second step", |_ctx| async { Ok(Success) })
             .build(),
     );
 

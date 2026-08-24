@@ -46,7 +46,7 @@ async fn main() {
             .on_success(|| async { info!("run succeeded") })
             .on_failure(|| async { info!("run failed after exhausting retries") })
             .on_finish(|| async { info!("task finished its lifecycle") })
-            .add_step("Flaky step", move || {
+            .add_step("Flaky step", move |_ctx| {
                 let attempts = step_attempts.clone();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst);

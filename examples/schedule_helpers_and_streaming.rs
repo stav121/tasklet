@@ -20,11 +20,11 @@ async fn main() {
     // second step is slow, so its predecessor shows as completed while it runs.
     let task = TaskBuilder::new(chrono::Local)
         .every_seconds(2)
-        .add_step("prepare", || async {
+        .add_step("prepare", |_ctx| async {
             info!("step 1: prepare");
             Ok(Success)
         })
-        .add_step("work (slow)", || async {
+        .add_step("work (slow)", |_ctx| async {
             info!("step 2: working...");
             tokio::time::sleep(Duration::from_millis(1200)).await;
             info!("step 2: done");
