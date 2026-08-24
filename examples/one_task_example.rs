@@ -24,11 +24,11 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step_default(|| async {
+            .add_step_default(|_ctx| async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
             })
-            .add_step_default(move || {
+            .add_step_default(move |_ctx| {
                 // Snapshot the counter for this run, then advance it so the returned
                 // future can own its state and stay `'static`.
                 let count = exec_count;

@@ -1,8 +1,9 @@
+use crate::blackboard::Blackboard;
 use crate::errors::{TaskError, TaskResult};
 use crate::retry::RetryPolicy;
 use crate::task::{
-    boxed_callback, CallbackFn, OverlapPolicy, Task, TaskStep, TaskStepStatusErr, TaskStepStatusOk,
-    DEFAULT_HISTORY_LIMIT,
+    boxed_callback, CallbackFn, OverlapPolicy, Task, TaskContext, TaskStep, TaskStepStatusErr,
+    TaskStepStatusOk, DEFAULT_HISTORY_LIMIT,
 };
 use chrono::TimeZone;
 use cron::Schedule;
@@ -43,6 +44,8 @@ where
     on_finish: Option<Box<CallbackFn>>,
     /// Behaviour when a run overlaps a still-running one.
     overlap: OverlapPolicy,
+    /// (Optional) task-level blackboard shared with every step through its context.
+    blackboard: Option<Blackboard>,
     /// The Task/Scheduler timezone.
     timezone: T,
 }
@@ -78,6 +81,7 @@ where
             on_failure: None,
             on_finish: None,
             overlap: OverlapPolicy::default(),
+            blackboard: None,
             timezone,
         }
     }
@@ -342,6 +346,35 @@ where
     ///     .build()
     ///     .unwrap();
     /// ```
+    /// Attach a task-level [`Blackboard`] to the generated task.
+    ///
+    /// Every step receives it through its [`TaskContext`]
+    /// ([`ctx.blackboard()`](TaskContext::blackboard)), so steps can share state across
+    /// runs without capturing their own clone. Attaching the *same* blackboard to
+    /// several tasks lets those tasks share data. If not set, each task gets a fresh,
+    /// empty blackboard.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::task::TaskStepStatusOk::Success;
+    /// # use tasklet::{Blackboard, TaskBuilder};
+    /// let board = Blackboard::new();
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .blackboard(board.clone())
+    ///     .add_step("use it", |ctx| async move {
+    ///         let n: u32 = ctx.blackboard().get_or_insert("runs", 0);
+    ///         ctx.blackboard().set("runs", n + 1);
+    ///         Ok(Success)
+    ///     })
+    ///     .build();
+    /// ```
+    pub fn blackboard(mut self, blackboard: Blackboard) -> TaskBuilder<T> {
+        self.blackboard = Some(blackboard);
+        self
+    }
+
     pub fn overlap(mut self, overlap: OverlapPolicy) -> TaskBuilder<T> {
         self.overlap = overlap;
         self
@@ -433,14 +466,18 @@ where
     ///
     /// # Examples
     ///
+    /// Each step is handed a [`TaskContext`] identifying the run and giving access to
+    /// the task-level [`Blackboard`] and a per-run store; ignore it with `|_ctx|` if the
+    /// step does not need it.
+    ///
     /// ```rust
     /// # use tasklet::task::TaskStepStatusErr::Error;
     /// # use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", || async { Err(Error) });
+    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", |_ctx| async { Err(Error) });
     /// ```
     pub fn add_step<F, Fut>(mut self, description: &str, function: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Fut) + Send + 'static,
+        F: (FnMut(TaskContext) -> Fut) + Send + 'static,
         Fut: std::future::Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>>
             + Send
             + 'static,
@@ -458,11 +495,11 @@ where
     /// ```
     /// # use tasklet::task::TaskStepStatusOk::Success;
     /// use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Local).add_step_default(|| async { Ok(Success) });
+    /// let _ = TaskBuilder::new(chrono::Local).add_step_default(|_ctx| async { Ok(Success) });
     /// ```
     pub fn add_step_default<F, Fut>(mut self, function: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(TaskContext) -> Fut) + 'static + Send,
         Fut: std::future::Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>>
             + Send
             + 'static,
@@ -522,6 +559,11 @@ where
             task.set_retry_policy(policy);
         }
         task.set_overlap(self.overlap);
+
+        // Attach the task-level blackboard, if one was provided.
+        if let Some(blackboard) = self.blackboard {
+            task.set_blackboard(blackboard);
+        }
 
         // Transfer the lifecycle callbacks.
         task.set_callbacks(self.on_success, self.on_failure, self.on_finish);
@@ -599,7 +641,7 @@ mod test {
     /// Test the normal functionality of the add_step() function of the `TaskBuilder`.
     #[test]
     pub fn test_task_builder_add_step() {
-        let builder = TaskBuilder::new(chrono::Utc).add_step_default(|| async { Ok(Success) });
+        let builder = TaskBuilder::new(chrono::Utc).add_step_default(|_ctx| async { Ok(Success) });
         assert_eq!(builder.timezone, chrono::Utc);
         assert_eq!(builder.steps.len(), 1);
     }
@@ -611,7 +653,7 @@ mod test {
             .every("* * * * * * *")
             .repeat(5)
             .description("Some description")
-            .add_step("Step 1", || async { Ok(Success) })
+            .add_step("Step 1", |_ctx| async { Ok(Success) })
             .build()
             .unwrap();
         assert_some!(task.repeats);
@@ -625,7 +667,7 @@ mod test {
     pub fn test_task_builder_build_default() {
         let task = TaskBuilder::new(chrono::Utc)
             .repeat(5)
-            .add_step("Step 1", || async { Ok(Success) })
+            .add_step("Step 1", |_ctx| async { Ok(Success) })
             .build()
             .unwrap();
         assert_some!(task.repeats);
@@ -722,5 +764,27 @@ mod test {
         // Second 60 is out of range, so the generated expression is invalid.
         let result = TaskBuilder::new(chrono::Utc).every_seconds(60).build();
         assert!(matches!(result, Err(TaskError::InvalidCronExpression(_))));
+    }
+
+    /// A blackboard attached via the builder reaches the step's context. (0.5.0)
+    #[tokio::test]
+    async fn test_builder_blackboard_reaches_step_context() {
+        let board = Blackboard::new();
+        board.set("seed", 41u32);
+        let mut task = TaskBuilder::new(chrono::Local)
+            .every("* * * * * * *")
+            .blackboard(board.clone())
+            .add_step("bump", |ctx| async move {
+                let seed: u32 = ctx.blackboard().get("seed").unwrap_or(0);
+                ctx.blackboard().set("seed", seed + 1);
+                Ok(Success)
+            })
+            .build()
+            .unwrap();
+        task.set_id(0);
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+        // The step saw the attached blackboard and wrote back through it.
+        assert_eq!(board.get::<u32>("seed"), Some(42));
     }
 }

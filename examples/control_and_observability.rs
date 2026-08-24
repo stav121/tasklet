@@ -26,7 +26,7 @@ async fn main() {
     let producer = TaskBuilder::new(chrono::Local)
         .every("* * * * * * *")
         .name("producer")
-        .add_step("increment", move || {
+        .add_step("increment", move |_ctx| {
             let board = producer_board.clone();
             async move {
                 let n = board.get_or_insert("count", 0u32) + 1;
@@ -43,7 +43,7 @@ async fn main() {
     let consumer = TaskBuilder::new(chrono::Local)
         .every("* * * * * * *")
         .name("consumer")
-        .add_step("read", move || {
+        .add_step("read", move |_ctx| {
             let board = consumer_board.clone();
             async move {
                 match board.get::<u32>("count") {

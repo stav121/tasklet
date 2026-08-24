@@ -28,7 +28,7 @@ async fn main() {
         .every("* * * * * * *")
         .description("Slow task")
         .overlap(OverlapPolicy::Skip) // default; shown here for clarity
-        .add_step("Slow step", move || {
+        .add_step("Slow step", move |_ctx| {
             let s = s.clone();
             async move {
                 let n = s.fetch_add(1, Ordering::SeqCst) + 1;
@@ -46,7 +46,7 @@ async fn main() {
     let fast_task = TaskBuilder::new(chrono::Local)
         .every("* * * * * * *")
         .description("Fast task")
-        .add_step("Fast step", move || {
+        .add_step("Fast step", move |_ctx| {
             let f = f.clone();
             async move {
                 info!("fast run #{}", f.fetch_add(1, Ordering::SeqCst) + 1);

@@ -10,8 +10,115 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
+
+/// A request sent from a [`TaskSpawner`] to a running scheduler asking it to add a task.
+///
+/// The optional `reply` channel carries the assigned id (or the rejection error) back
+/// to the caller of [`TaskSpawner::spawn_get_id`].
+struct SpawnRequest<T>
+where
+    T: TimeZone + Clone + Send + 'static,
+{
+    task: Task<T>,
+    reply: Option<oneshot::Sender<Result<usize, TaskError>>>,
+}
+
+/// A cloneable handle for adding tasks to a *running* [`TaskScheduler`] at runtime.
+///
+/// The type-erased [`SchedulerHandle`] cannot add tasks because a `Task<T>` carries the
+/// scheduler's timezone type `T` and its step closures. A `TaskSpawner<T>` keeps that
+/// type, so it can hand fully-built tasks to the scheduler from anywhere (another task,
+/// an API handler, a signal handler). Obtain one with [`TaskScheduler::spawner`] before
+/// calling [`run`](TaskScheduler::run).
+///
+/// Spawned tasks are picked up on the next scheduler round, so they are only processed
+/// while the scheduler is running (like tasks produced by a
+/// [`TaskGenerator`](crate::TaskGenerator)).
+///
+/// # Examples
+///
+/// ```
+/// # use tasklet::{TaskBuilder, TaskScheduler};
+/// # use std::time::Duration;
+/// # tokio_test::block_on(async {
+/// let mut scheduler = TaskScheduler::new(50, chrono::Local);
+/// let spawner = scheduler.spawner();
+///
+/// // Add a task from another task once the scheduler is running.
+/// tokio::spawn(async move {
+///     let _ = spawner.spawn(
+///         TaskBuilder::new(chrono::Local)
+///             .every("* * * * * * *")
+///             .add_step_default(|_ctx| async { Ok(tasklet::task::TaskStepStatusOk::Success) })
+///             .build(),
+///     );
+/// });
+///
+/// scheduler.run_until(tokio::time::sleep(Duration::from_millis(150))).await;
+/// # });
+/// ```
+pub struct TaskSpawner<T>
+where
+    T: TimeZone + Clone + Send + 'static,
+{
+    tx: mpsc::UnboundedSender<SpawnRequest<T>>,
+}
+
+// A manual `Clone` avoids an unnecessary `T: Clone` bound the derive would add: the
+// only field is an `UnboundedSender`, which is always cloneable.
+impl<T> Clone for TaskSpawner<T>
+where
+    T: TimeZone + Clone + Send + 'static,
+{
+    fn clone(&self) -> Self {
+        TaskSpawner {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<T> TaskSpawner<T>
+where
+    T: TimeZone + Clone + Send + 'static,
+    <T as TimeZone>::Offset: Send,
+{
+    /// Queue a task to be added on the scheduler's next round.
+    ///
+    /// A build error in `task` is returned immediately. The task is otherwise queued
+    /// fire-and-forget; if it carries a name that collides with an existing task it is
+    /// rejected on the scheduler side (observable via the handle rather than here). Use
+    /// [`spawn_get_id`](Self::spawn_get_id) to await the assigned id or the rejection.
+    ///
+    /// Returns [`TaskError::ExecutionError`] if the scheduler has already stopped.
+    pub fn spawn(&self, task: TaskResult<Task<T>>) -> TaskResult<()> {
+        let task = task?;
+        self.tx
+            .send(SpawnRequest { task, reply: None })
+            .map_err(|_| TaskError::ExecutionError("scheduler is no longer running".to_string()))
+    }
+
+    /// Queue a task and await the id the scheduler assigns it.
+    ///
+    /// Resolves once the scheduler processes the request on its next round. A build
+    /// error is returned immediately; a duplicate name is reported as
+    /// [`TaskError::DuplicateTaskName`]; a stopped scheduler as
+    /// [`TaskError::ExecutionError`].
+    pub async fn spawn_get_id(&self, task: TaskResult<Task<T>>) -> TaskResult<usize> {
+        let task = task?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(SpawnRequest {
+                task,
+                reply: Some(reply_tx),
+            })
+            .map_err(|_| TaskError::ExecutionError("scheduler is no longer running".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            TaskError::ExecutionError("scheduler dropped the spawn request".to_string())
+        })?
+    }
+}
 
 /// Handler for a running task.
 ///
@@ -307,6 +414,10 @@ where
     /// The observable/controllable registry, rebuilt each round and shared with every
     /// [`SchedulerHandle`].
     registry: Arc<Mutex<Vec<RegEntry>>>,
+    /// Sender cloned into every [`TaskSpawner`] handed out via [`spawner`](Self::spawner).
+    spawn_tx: mpsc::UnboundedSender<SpawnRequest<T>>,
+    /// Receiver drained each round for tasks queued by a [`TaskSpawner`].
+    spawn_rx: mpsc::UnboundedReceiver<SpawnRequest<T>>,
 }
 
 /// `TaskScheduler` implementation.
@@ -328,6 +439,7 @@ where
     /// let _ = TaskScheduler::default(chrono::Utc);
     /// ```
     pub fn default(timezone: T) -> TaskScheduler<T> {
+        let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         TaskScheduler {
             handles: Vec::new(),
             /* Originally empty, no registered tasks. */
@@ -337,6 +449,8 @@ where
             next_id: 0,
             shutdown: Arc::new(Notify::new()),
             registry: Arc::new(Mutex::new(Vec::new())),
+            spawn_tx,
+            spawn_rx,
         }
     }
 
@@ -353,6 +467,26 @@ where
         SchedulerHandle {
             notify: self.shutdown.clone(),
             registry: self.registry.clone(),
+        }
+    }
+
+    /// Return a cloneable [`TaskSpawner`] that can add tasks to this scheduler while it
+    /// is running.
+    ///
+    /// Unlike [`SchedulerHandle`], a spawner keeps the scheduler's timezone type `T`, so
+    /// it can hand fully-built `Task<T>` values to the running loop. Obtain it before
+    /// calling [`run`](Self::run); queued tasks are added on the next round.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// let scheduler = TaskScheduler::default(chrono::Utc);
+    /// let _spawner = scheduler.spawner();
+    /// ```
+    pub fn spawner(&self) -> TaskSpawner<T> {
+        TaskSpawner {
+            tx: self.spawn_tx.clone(),
         }
     }
 
@@ -483,7 +617,24 @@ where
 
         // Increase the id of the next task.
         self.next_id += 1;
+
+        // Publish the new task into the shared registry immediately so a
+        // `SchedulerHandle` can observe and control it before `run()` is called, not
+        // only after the first scheduling round.
+        self.refresh_registry();
         Ok(id)
+    }
+
+    /// Add every task queued by a [`TaskSpawner`] since the last round, replying with the
+    /// assigned id (or the rejection error) to any caller awaiting one.
+    fn drain_spawns(&mut self) {
+        while let Ok(request) = self.spawn_rx.try_recv() {
+            let result = self.add_task_get_id(Ok(request.task));
+            if let Some(reply) = request.reply {
+                // The receiver may have gone away; that is fine.
+                let _ = reply.send(result);
+            }
+        }
     }
 
     /// Run a single scheduling round.
@@ -602,6 +753,7 @@ where
     /// dispatch the current round. Newly generated tasks initialize themselves.
     fn tick(&mut self) {
         self.run_task_gen();
+        self.drain_spawns();
         self.dispatch_round();
     }
 
@@ -714,7 +866,7 @@ mod test {
         let c = counter.clone();
         let mut builder = TaskBuilder::new(Local)
             .every("* * * * * * *")
-            .add_step_default(move || {
+            .add_step_default(move |_ctx| {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -777,7 +929,7 @@ mod test {
         let s = slow.clone();
         let slow_task = TaskBuilder::new(Local)
             .every("* * * * * * *")
-            .add_step_default(move || {
+            .add_step_default(move |_ctx| {
                 let s = s.clone();
                 async move {
                     s.fetch_add(1, Ordering::SeqCst);
@@ -882,7 +1034,7 @@ mod test {
         let mut scheduler = TaskScheduler::new(100, Local);
 
         let mut doomed = Task::new("* * * * * * *", None, None, Local).unwrap();
-        doomed.add_step_default(|| async { Err(ErrorDelete) });
+        doomed.add_step_default(|_ctx| async { Err(ErrorDelete) });
         scheduler.add_task(Ok(doomed)).unwrap();
         scheduler.add_task(counting_task(&survivor, None)).unwrap();
 
@@ -1031,8 +1183,9 @@ mod test {
             .unwrap();
 
         let handle = scheduler.handle();
-        // Before running, the snapshot is empty.
-        assert_eq!(handle.task_count(), 0);
+        // The registry is populated at `add_task` time, so both tasks are visible
+        // through the handle before `run()` is ever called.
+        assert_eq!(handle.task_count(), 2);
 
         let probe = handle.clone();
         let observer = tokio::spawn(async move {
@@ -1238,7 +1391,7 @@ mod test {
         let task = TaskBuilder::new(Local)
             .every("* * * * * * *")
             .name("worker")
-            .add_step("do work", move || {
+            .add_step("do work", move |_ctx| {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -1289,7 +1442,7 @@ mod test {
         let task = TaskBuilder::new(Local)
             .every("* * * * * * *")
             .name("named")
-            .add_step_default(move || {
+            .add_step_default(move |_ctx| {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -1338,5 +1491,100 @@ mod test {
         assert!(back.paused);
         assert_eq!(back.last_outcome, Some(RunOutcome::Success));
         assert_eq!(back.run_count, 5);
+    }
+
+    /// A `TaskSpawner` adds a task to a running scheduler, which then executes it. (0.5.0)
+    #[tokio::test]
+    async fn test_spawner_adds_task_at_runtime() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let spawner = scheduler.spawner();
+        let handle = scheduler.handle();
+
+        // Nothing registered up front.
+        assert_eq!(handle.task_count(), 0);
+
+        let c = counter.clone();
+        let injector = tokio::spawn(async move {
+            // Let the scheduler start, then inject a task from outside.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let task = TaskBuilder::new(Local)
+                .every("* * * * * * *")
+                .add_step_default(move |_ctx| {
+                    let c = c.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(Success)
+                    }
+                })
+                .build();
+            spawner.spawn(task).expect("spawn should be accepted");
+        });
+
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1500)))
+            .await;
+        injector.await.unwrap();
+
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "spawned task should have executed at least once"
+        );
+    }
+
+    /// `spawn_get_id` resolves with the id the scheduler assigns the task. (0.5.0)
+    #[tokio::test]
+    async fn test_spawner_get_id_returns_assigned_id() {
+        let mut scheduler = TaskScheduler::new(50, Local);
+        // Pre-register one task so the next assigned id is 1.
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        let spawner = scheduler.spawner();
+
+        let getter = tokio::spawn(async move {
+            let task = TaskBuilder::new(Local).every("* * * * * * *").build();
+            spawner.spawn_get_id(task).await
+        });
+
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(400)))
+            .await;
+
+        let id = getter.await.unwrap().expect("spawn_get_id should succeed");
+        assert_eq!(id, 1, "the injected task should be assigned the next id");
+    }
+
+    /// A spawned task whose name collides with an existing one is rejected. (0.5.0)
+    #[tokio::test]
+    async fn test_spawner_rejects_duplicate_name() {
+        let mut scheduler = TaskScheduler::new(50, Local);
+        scheduler
+            .add_task(
+                TaskBuilder::new(Local)
+                    .every("* * * * * * *")
+                    .name("dup")
+                    .build(),
+            )
+            .unwrap();
+        let spawner = scheduler.spawner();
+
+        let getter = tokio::spawn(async move {
+            let task = TaskBuilder::new(Local)
+                .every("* * * * * * *")
+                .name("dup")
+                .build();
+            spawner.spawn_get_id(task).await
+        });
+
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(400)))
+            .await;
+
+        let result = getter.await.unwrap();
+        assert!(
+            matches!(result, Err(TaskError::DuplicateTaskName(name)) if name == "dup"),
+            "a duplicate name must be rejected on the scheduler side"
+        );
     }
 }

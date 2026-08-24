@@ -1,6 +1,7 @@
 extern crate chrono;
 extern crate cron;
 
+use crate::blackboard::Blackboard;
 use crate::errors::{TaskError, TaskResult};
 use crate::retry::RetryPolicy;
 use crate::{step_log, task_log};
@@ -46,8 +47,109 @@ pub type StepFuture =
 
 /// An executable, asynchronous function.
 ///
-/// Each call produces a fresh [`StepFuture`] to be awaited.
-pub type ExecutableFn = dyn FnMut() -> StepFuture + 'static + Send;
+/// Each call is handed a [`TaskContext`] for the current attempt and produces a fresh
+/// [`StepFuture`] to be awaited.
+pub type ExecutableFn = dyn FnMut(TaskContext) -> StepFuture + 'static + Send;
+
+/// The execution context handed to a step each time it runs.
+///
+/// A `TaskContext` identifies the run (which task, which run, which step, which attempt)
+/// and gives the step access to two typed key/value stores:
+///
+/// * [`blackboard`](TaskContext::blackboard) - the task-level [`Blackboard`], shared
+///   across every run of the task and, if the same blackboard is attached to several
+///   tasks via [`TaskBuilder::blackboard`](crate::TaskBuilder::blackboard), across those
+///   tasks too. Use it for state that must outlive a single run.
+/// * [`run_store`](TaskContext::run_store) - a fresh [`Blackboard`] created for each run,
+///   so steps can hand values to later steps within the same run without leaking them
+///   into the next run (an XCom-like scratchpad).
+///
+/// The context is cheap to clone (both stores are `Arc`-backed); it is moved into the
+/// step's future, so a step can keep it for the duration of its async work.
+///
+/// # Examples
+///
+/// ```
+/// use tasklet::task::TaskStepStatusOk::Success;
+/// use tasklet::TaskBuilder;
+///
+/// let _task = TaskBuilder::new(chrono::Local)
+///     .every("* * * * * * *")
+///     .add_step("produce", |ctx| async move {
+///         ctx.run_store().set("value", 21u32);
+///         Ok(Success)
+///     })
+///     .add_step("consume", |ctx| async move {
+///         let doubled = ctx.run_store().get::<u32>("value").unwrap_or(0) * 2;
+///         assert_eq!(doubled, 42);
+///         Ok(Success)
+///     })
+///     .build();
+/// ```
+#[derive(Clone)]
+pub struct TaskContext {
+    task_id: usize,
+    task_name: Option<Arc<str>>,
+    run_id: usize,
+    step_index: usize,
+    attempt: u32,
+    blackboard: Blackboard,
+    run_store: Blackboard,
+}
+
+impl TaskContext {
+    /// The id the scheduler assigned to the running task.
+    pub fn task_id(&self) -> usize {
+        self.task_id
+    }
+
+    /// The task's unique name, if one was set via
+    /// [`TaskBuilder::name`](crate::TaskBuilder::name).
+    pub fn task_name(&self) -> Option<&str> {
+        self.task_name.as_deref()
+    }
+
+    /// The id of the current run (monotonically increasing per task).
+    pub fn run_id(&self) -> usize {
+        self.run_id
+    }
+
+    /// The zero-based index of the step this context was handed to.
+    pub fn step_index(&self) -> usize {
+        self.step_index
+    }
+
+    /// The current attempt number for this step, starting at 1. Values above 1 mean an
+    /// earlier attempt failed and is being retried under the task's
+    /// [`RetryPolicy`].
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// The task-level [`Blackboard`], shared across runs (and across tasks that share
+    /// the same blackboard).
+    pub fn blackboard(&self) -> &Blackboard {
+        &self.blackboard
+    }
+
+    /// A per-run [`Blackboard`], created fresh for each run, for handing values between
+    /// steps within a single run.
+    pub fn run_store(&self) -> &Blackboard {
+        &self.run_store
+    }
+}
+
+impl fmt::Debug for TaskContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskContext")
+            .field("task_id", &self.task_id)
+            .field("task_name", &self.task_name)
+            .field("run_id", &self.run_id)
+            .field("step_index", &self.step_index)
+            .field("attempt", &self.attempt)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The boxed future produced by a lifecycle callback when it is invoked.
 pub type CallbackFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -97,16 +199,16 @@ impl TaskStep {
     ///
     /// ```
     /// # use tasklet::task::{TaskStep, TaskStepStatusOk};
-    /// let _ = TaskStep::new("Some task", || async { Ok(TaskStepStatusOk::Success) });
+    /// let _ = TaskStep::new("Some task", |_ctx| async { Ok(TaskStepStatusOk::Success) });
     /// ```
     pub fn new<F, Fut>(description: &str, mut function: F) -> Self
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(TaskContext) -> Fut) + 'static + Send,
         Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         Self {
             description: Some(description.to_string()),
-            function: Box::new(move || Box::pin(function())),
+            function: Box::new(move |ctx| Box::pin(function(ctx))),
         }
     }
 
@@ -121,15 +223,15 @@ impl TaskStep {
     /// ```
     /// # use tasklet::task::TaskStep;
     /// use tasklet::task::TaskStepStatusOk::Success;
-    /// let _ = TaskStep::default(|| async { Ok(Success) });
+    /// let _ = TaskStep::default(|_ctx| async { Ok(Success) });
     /// ```
     pub fn default<F, Fut>(mut function: F) -> Self
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(TaskContext) -> Fut) + 'static + Send,
         Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         Self {
-            function: Box::new(move || Box::pin(function())),
+            function: Box::new(move |ctx| Box::pin(function(ctx))),
             description: None,
         }
     }
@@ -387,6 +489,11 @@ where
     pub(crate) on_finish: Option<Box<CallbackFn>>,
     /// Behaviour when a scheduled run overlaps a still-running one.
     pub(crate) overlap: OverlapPolicy,
+    /// The task-level shared store handed to every step through its [`TaskContext`].
+    /// Defaults to a fresh, empty [`Blackboard`]; attach a shared one via
+    /// [`TaskBuilder::blackboard`](crate::TaskBuilder::blackboard) to pass data across
+    /// tasks.
+    pub(crate) blackboard: Blackboard,
 }
 
 impl<T> Debug for Task<T>
@@ -466,6 +573,7 @@ where
             on_failure: None,
             on_finish: None,
             overlap: OverlapPolicy::default(),
+            blackboard: Blackboard::new(),
         })
     }
 
@@ -502,7 +610,7 @@ where
     #[cfg(test)]
     pub(crate) fn add_step<F, Fut>(&mut self, description: &str, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(TaskContext) -> Fut) + 'static + Send,
         Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         self.steps.push(TaskStep::new(description, function));
@@ -517,7 +625,7 @@ where
     #[cfg(test)]
     pub(crate) fn add_step_default<F, Fut>(&mut self, function: F) -> &mut Task<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(TaskContext) -> Fut) + 'static + Send,
         Fut: Future<Output = Result<TaskStepStatusOk, TaskStepStatusErr>> + Send + 'static,
     {
         self.steps.push(TaskStep::default(function));
@@ -571,6 +679,13 @@ where
     /// Set the maximum number of run records retained for this task.
     pub(crate) fn set_history_limit(&mut self, limit: usize) -> &mut Task<T> {
         self.history_limit = limit;
+        self
+    }
+
+    /// Attach a task-level [`Blackboard`], shared with every step through its
+    /// [`TaskContext`].
+    pub(crate) fn set_blackboard(&mut self, blackboard: Blackboard) -> &mut Task<T> {
+        self.blackboard = blackboard;
         self
     }
 
@@ -649,8 +764,8 @@ where
     /// Run the task's steps and fire the success/failure callbacks based on the
     /// outcome. `on_finish` is fired here only for the terminal `ForceRemoved` state
     /// (a normally-finishing task fires it from [`Task::reschedule_and_notify`]).
-    pub(crate) async fn run_and_notify(&mut self) {
-        let _ = self.run_task().await; // status is updated in place; the result is redundant
+    pub(crate) async fn run_and_notify(&mut self, run_id: usize) {
+        let _ = self.run_task(run_id).await; // status is updated in place; the result is redundant
         match self.status {
             Status::Executed => Self::fire_callback(&mut self.on_success).await,
             Status::Failed => Self::fire_callback(&mut self.on_failure).await,
@@ -704,7 +819,10 @@ where
     }
 
     /// Run the task and handle the output.
-    pub(crate) async fn run_task(&mut self) -> TaskResult<()> {
+    ///
+    /// `run_id` identifies the current run and is surfaced to each step through its
+    /// [`TaskContext`].
+    pub(crate) async fn run_task(&mut self, run_id: usize) -> TaskResult<()> {
         match &self.status {
             Status::Init => Err(TaskError::NotInitialized),
             Status::Failed => Err(TaskError::Failed),
@@ -730,6 +848,13 @@ where
                 // Stream the fresh (all-pending) snapshot so observers see the run begin.
                 self.publish_steps();
 
+                // A fresh per-run store for step-to-step data flow, plus the task
+                // identity captured once so building each attempt's context is cheap.
+                let run_store = Blackboard::new();
+                let task_name: Option<Arc<str>> = self.name.as_deref().map(Arc::from);
+                let task_id = self.task_id;
+                let blackboard = self.blackboard.clone();
+
                 let mut had_error: bool = false;
                 // Iterate by index so `self` is free between step invocations, letting us
                 // stream each transition to the shared cell as it happens.
@@ -748,6 +873,19 @@ where
                         attempt += 1;
                         self.last_attempts += 1;
 
+                        // The context handed to the step for this attempt. Cheap to
+                        // build: the stores are `Arc`-backed clones and the name is a
+                        // shared `Arc<str>`.
+                        let ctx = TaskContext {
+                            task_id,
+                            task_name: task_name.clone(),
+                            run_id,
+                            step_index: index,
+                            attempt,
+                            blackboard: blackboard.clone(),
+                            run_store: run_store.clone(),
+                        };
+
                         // Run the step, optionally bounded by the configured timeout.
                         // A timeout is treated as a (retryable) `Error`. Producing the
                         // step future borrows `self.steps[index]` only until it returns;
@@ -755,8 +893,11 @@ where
                         // await and `self` is free afterwards.
                         let result = match timeout {
                             Some(duration) => {
-                                match tokio::time::timeout(duration, (self.steps[index].function)())
-                                    .await
+                                match tokio::time::timeout(
+                                    duration,
+                                    (self.steps[index].function)(ctx),
+                                )
+                                .await
                                 {
                                     Ok(result) => result,
                                     Err(_) => {
@@ -772,7 +913,7 @@ where
                                     }
                                 }
                             }
-                            None => (self.steps[index].function)().await,
+                            None => (self.steps[index].function)(ctx).await,
                         };
 
                         match result {
@@ -951,7 +1092,7 @@ where
 {
     let run_id = shared.start_run(Utc::now());
     shared.running.store(true, Ordering::SeqCst);
-    task.run_and_notify().await;
+    task.run_and_notify(run_id).await;
     // Capture the outcome before `reschedule` overwrites the status.
     let outcome = task.run_outcome();
     task.reschedule_and_notify().await;
@@ -1016,16 +1157,16 @@ mod test {
     #[tokio::test]
     async fn normal_task_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
@@ -1036,7 +1177,7 @@ mod test {
         let schedule: Schedule = "* * * * * * *".parse().unwrap();
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
         task.set_schedule(schedule);
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -1046,16 +1187,16 @@ mod test {
     #[tokio::test]
     async fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
-        task.add_step_default(|| async { Err(Error) });
+        task.add_step_default(|_ctx| async { Err(Error) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Failed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Scheduled);
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Failed);
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
@@ -1065,14 +1206,14 @@ mod test {
     #[tokio::test]
     async fn normal_task_no_fixed_repeats_test() {
         let mut task = Task::new("* * * * * * *", Some("Test task"), None, Local).unwrap();
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
         assert_eq!(task.status, Status::Scheduled);
         // Run it for a few times.
         for _i in 1..10 {
-            assert!(task.run_task().await.is_ok());
+            assert!(task.run_task(0).await.is_ok());
             assert_eq!(task.status, Status::Executed);
             assert!(task.reschedule().is_ok());
             assert_eq!(task.status, Status::Scheduled);
@@ -1096,7 +1237,7 @@ mod test {
         // Execute the task.
         task.set_id(0);
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
     }
@@ -1104,9 +1245,9 @@ mod test {
     #[tokio::test]
     async fn test_run_uninitialized_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        assert!(task.run_task().await.is_err());
+        assert!(task.run_task(0).await.is_err());
         assert!(matches!(
-            task.run_task().await.unwrap_err(),
+            task.run_task(0).await.unwrap_err(),
             TaskError::NotInitialized
         ));
     }
@@ -1114,15 +1255,15 @@ mod test {
     #[tokio::test]
     async fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|| async { Err(Error) });
+        task.add_step_default(|_ctx| async { Err(Error) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Failed);
         // Attempt to rerun it, it should fail.
-        assert!(task.run_task().await.is_err());
+        assert!(task.run_task(0).await.is_err());
         assert!(matches!(
-            task.run_task().await.unwrap_err(),
+            task.run_task(0).await.unwrap_err(),
             TaskError::Failed
         ));
     }
@@ -1130,15 +1271,15 @@ mod test {
     #[tokio::test]
     async fn test_run_executed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step("Step 1", || async { Ok(Success) });
+        task.add_step("Step 1", |_ctx| async { Ok(Success) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         // Attempt to run it again, it should fail.
-        assert!(task.run_task().await.is_err());
+        assert!(task.run_task(0).await.is_err());
         assert!(matches!(
-            task.run_task().await.unwrap_err(),
+            task.run_task(0).await.unwrap_err(),
             TaskError::AlreadyExecuted
         ));
     }
@@ -1148,13 +1289,13 @@ mod test {
         let mut task = Task::new("* * * * * * *", None, Some(1), Local).unwrap();
         task.set_id(0);
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert!(task.reschedule().is_ok());
         assert_eq!(task.status, Status::Finished);
         // At this point the task is Finished. It should not be allowed to run again.
-        assert!(task.run_task().await.is_err());
+        assert!(task.run_task(0).await.is_err());
         assert!(matches!(
-            task.run_task().await.unwrap_err(),
+            task.run_task(0).await.unwrap_err(),
             TaskError::Finished
         ));
     }
@@ -1162,10 +1303,10 @@ mod test {
     #[tokio::test]
     async fn test_run_failed_delete() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|| async { Err(ErrorDelete) });
+        task.add_step_default(|_ctx| async { Err(ErrorDelete) });
         task.set_id(0);
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::ForceRemoved);
     }
 
@@ -1197,10 +1338,10 @@ mod test {
         assert_eq!(task.status, Status::Scheduled);
 
         // Add a step that succeeds
-        task.add_step_default(|| async { Ok(TaskStepStatusOk::Success) });
+        task.add_step_default(|_ctx| async { Ok(TaskStepStatusOk::Success) });
 
         // After run_task(), status should be Executed
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
 
         // After reschedule(), with repeats=1 and already executed once,
@@ -1212,15 +1353,16 @@ mod test {
     #[test]
     fn test_task_step_display() {
         // Test with description
-        let step_with_desc = TaskStep::new("Test step", || async { Ok(TaskStepStatusOk::Success) });
+        let step_with_desc =
+            TaskStep::new("Test step", |_ctx| async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_with_desc), "Test step");
 
         // Test without description
-        let step_no_desc = TaskStep::default(|| async { Ok(TaskStepStatusOk::Success) });
+        let step_no_desc = TaskStep::default(|_ctx| async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_no_desc), "-");
 
         // Test with empty description
-        let step_empty_desc = TaskStep::new("", || async { Ok(TaskStepStatusOk::Success) });
+        let step_empty_desc = TaskStep::new("", |_ctx| async { Ok(TaskStepStatusOk::Success) });
         assert_eq!(format!("{}", step_empty_desc), "-");
     }
 
@@ -1228,13 +1370,13 @@ mod test {
     async fn test_run_and_reschedule_notify() {
         let mut task = Task::new("* * * * * * *", Some("Notify flow"), Some(1), Utc).unwrap();
         task.set_id(1);
-        task.add_step("Test step", || async { Ok(TaskStepStatusOk::Success) });
+        task.add_step("Test step", |_ctx| async { Ok(TaskStepStatusOk::Success) });
 
         task.init();
         assert_eq!(task.status, Status::Scheduled);
 
         // One run drives Scheduled -> Executed.
-        task.run_and_notify().await;
+        task.run_and_notify(0).await;
         assert_eq!(task.status, Status::Executed);
 
         // With the single repeat spent, rescheduling retires the task.
@@ -1250,7 +1392,7 @@ mod test {
         let (tx, rx) = mpsc::channel(1);
         let mut task = Task::new("* * * * * * *", Some("Loop"), Some(1), Utc).unwrap();
         task.set_id(3);
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         task.set_receiver(rx);
 
         let shared = Arc::new(TaskShared::new(DEFAULT_HISTORY_LIMIT));
@@ -1286,7 +1428,7 @@ mod test {
 
         // Add steps that increment counters
         let c1 = counter1.clone();
-        task.add_step("Step 1", move || {
+        task.add_step("Step 1", move |_ctx| {
             let c1 = c1.clone();
             async move {
                 *c1.lock().unwrap() += 1;
@@ -1295,7 +1437,7 @@ mod test {
         });
 
         let c2 = counter2.clone();
-        task.add_step("Step 2", move || {
+        task.add_step("Step 2", move |_ctx| {
             let c2 = c2.clone();
             async move {
                 *c2.lock().unwrap() += 1;
@@ -1304,7 +1446,7 @@ mod test {
         });
 
         let c3 = counter3.clone();
-        task.add_step("Step 3", move || {
+        task.add_step("Step 3", move |_ctx| {
             let c3 = c3.clone();
             async move {
                 *c3.lock().unwrap() += 1;
@@ -1314,7 +1456,7 @@ mod test {
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
 
         // Verify all steps executed
         assert_eq!(*counter1.lock().unwrap(), 1);
@@ -1337,7 +1479,7 @@ mod test {
 
         // First step succeeds
         let counter = execution_counter.clone();
-        task.add_step("Step 1", move || {
+        task.add_step("Step 1", move |_ctx| {
             let counter = counter.clone();
             async move {
                 counter.lock().unwrap().push(1);
@@ -1347,7 +1489,7 @@ mod test {
 
         // Second step fails
         let counter = execution_counter.clone();
-        task.add_step("Step 2", move || {
+        task.add_step("Step 2", move |_ctx| {
             let counter = counter.clone();
             async move {
                 counter.lock().unwrap().push(2);
@@ -1357,7 +1499,7 @@ mod test {
 
         // Third step should not execute due to previous failure
         let counter = execution_counter.clone();
-        task.add_step("Step 3", move || {
+        task.add_step("Step 3", move |_ctx| {
             let counter = counter.clone();
             async move {
                 counter.lock().unwrap().push(3);
@@ -1367,7 +1509,7 @@ mod test {
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
 
         // Verify only steps 1 and 2 executed
         assert_eq!(*execution_counter.lock().unwrap(), vec![1, 2]);
@@ -1380,13 +1522,13 @@ mod test {
     async fn test_force_removal() {
         // Create a task with a step that forces removal
         let mut task = Task::new("* * * * * * *", Some("Force removal"), None, Local).unwrap();
-        task.add_step("Failing step", || async {
+        task.add_step("Failing step", |_ctx| async {
             Err(TaskStepStatusErr::ErrorDelete)
         });
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
 
         // Verify task is marked for force removal
         assert_eq!(task.status, Status::ForceRemoved);
@@ -1403,7 +1545,7 @@ mod test {
 
         // Initialize and run
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
 
         // Verify task is marked as Executed even with no steps
         assert_eq!(task.status, Status::Executed);
@@ -1419,7 +1561,7 @@ mod test {
         let flag = ran.clone();
 
         let mut task = Task::new("* * * * * * *", Some("Async step"), Some(1), Utc).unwrap();
-        task.add_step("Awaits", move || {
+        task.add_step("Awaits", move |_ctx| {
             let flag = flag.clone();
             async move {
                 // Yield to the runtime to prove the future is actually polled/awaited.
@@ -1430,7 +1572,7 @@ mod test {
         });
 
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert!(ran.load(Ordering::SeqCst), "async step body must run");
         assert_eq!(task.status, Status::Executed);
     }
@@ -1439,10 +1581,10 @@ mod test {
     #[tokio::test]
     async fn test_repeat_zero_does_not_underflow() {
         let mut task = Task::new("* * * * * * *", Some("Zero repeats"), Some(0), Utc).unwrap();
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         task.init();
         // Would panic with an integer underflow before the `saturating_sub` fix.
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.repeats, Some(0));
         // With no repeats left, the task is retired on reschedule.
         assert!(task.reschedule().is_ok());
@@ -1454,14 +1596,14 @@ mod test {
     async fn test_step_timeout_marks_failed() {
         let mut task = Task::new("* * * * * * *", Some("Timeout"), None, Utc).unwrap();
         task.timeout = Some(Duration::from_millis(50));
-        task.add_step_default(|| async {
+        task.add_step_default(|_ctx| async {
             // Sleeps far longer than the timeout; the paused clock auto-advances so
             // the timeout fires without a real wall-clock wait.
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(Success)
         });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Failed);
     }
 
@@ -1476,7 +1618,7 @@ mod test {
 
         let mut task = Task::new("* * * * * * *", Some("Retry ok"), None, Utc).unwrap();
         task.retry_policy = Some(RetryPolicy::fixed(3, Duration::from_millis(10)));
-        task.add_step_default(move || {
+        task.add_step_default(move |_ctx| {
             let c = c.clone();
             async move {
                 // Fail the first two attempts, succeed on the third.
@@ -1488,7 +1630,7 @@ mod test {
             }
         });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
@@ -1504,7 +1646,7 @@ mod test {
 
         let mut task = Task::new("* * * * * * *", Some("Retry fail"), None, Utc).unwrap();
         task.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_millis(10)));
-        task.add_step_default(move || {
+        task.add_step_default(move |_ctx| {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -1512,7 +1654,7 @@ mod test {
             }
         });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Failed);
         // 1 initial attempt + 2 retries.
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -1529,7 +1671,7 @@ mod test {
 
         let mut task = Task::new("* * * * * * *", Some("Delete"), None, Utc).unwrap();
         task.retry_policy = Some(RetryPolicy::fixed(5, Duration::from_millis(10)));
-        task.add_step_default(move || {
+        task.add_step_default(move |_ctx| {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -1537,7 +1679,7 @@ mod test {
             }
         });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::ForceRemoved);
         // Called exactly once — no retries.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1555,7 +1697,7 @@ mod test {
         let mut task = Task::new("* * * * * * *", Some("Timeout retry"), None, Utc).unwrap();
         task.timeout = Some(Duration::from_millis(50));
         task.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_millis(0)));
-        task.add_step_default(move || {
+        task.add_step_default(move |_ctx| {
             let c = c.clone();
             async move {
                 // First attempt hangs past the timeout; subsequent attempts return quickly.
@@ -1566,7 +1708,7 @@ mod test {
             }
         });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -1582,7 +1724,7 @@ mod test {
         let finish = Arc::new(AtomicUsize::new(0));
 
         let mut task = Task::new("* * * * * * *", Some("Callbacks"), Some(1), Utc).unwrap();
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
 
         let s = success.clone();
         task.on_success = Some(boxed_callback(move || {
@@ -1611,7 +1753,7 @@ mod test {
 
         // A run fires on_success; the follow-up reschedule retires the task (repeat 1)
         // and fires on_finish exactly once.
-        task.run_and_notify().await;
+        task.run_and_notify(0).await;
         task.reschedule_and_notify().await;
 
         assert_eq!(success.load(Ordering::SeqCst), 1);
@@ -1629,7 +1771,7 @@ mod test {
         let finish = Arc::new(AtomicUsize::new(0));
 
         let mut task = Task::new("* * * * * * *", Some("Callbacks delete"), None, Utc).unwrap();
-        task.add_step_default(|| async { Err(ErrorDelete) });
+        task.add_step_default(|_ctx| async { Err(ErrorDelete) });
 
         let f = failure.clone();
         task.on_failure = Some(boxed_callback(move || {
@@ -1650,7 +1792,7 @@ mod test {
         task.init();
 
         // ForceRemoved is terminal, so run_and_notify fires both on_failure and on_finish.
-        task.run_and_notify().await;
+        task.run_and_notify(0).await;
 
         assert_eq!(failure.load(Ordering::SeqCst), 1);
         assert_eq!(finish.load(Ordering::SeqCst), 1);
@@ -1660,9 +1802,9 @@ mod test {
     #[tokio::test]
     async fn test_step_states_track_outcomes() {
         let mut task = Task::new("* * * * * * *", Some("Steps"), Some(1), Utc).unwrap();
-        task.add_step("ok", || async { Ok(Success) });
-        task.add_step("boom", || async { Err(Error) });
-        task.add_step("never", || async { Ok(Success) });
+        task.add_step("ok", |_ctx| async { Ok(Success) });
+        task.add_step("boom", |_ctx| async { Err(Error) });
+        task.add_step("never", |_ctx| async { Ok(Success) });
         task.set_id(0);
         task.init();
 
@@ -1674,7 +1816,7 @@ mod test {
             .all(|s| s.status == StepStatus::Pending));
         assert_eq!(task.step_states[0].description.as_deref(), Some("ok"));
 
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.step_states[0].status, StepStatus::Succeeded);
         assert_eq!(task.step_states[1].status, StepStatus::Failed);
         assert_eq!(task.step_states[2].status, StepStatus::Skipped);
@@ -1685,9 +1827,9 @@ mod test {
     #[tokio::test]
     async fn test_run_outcome_had_errors() {
         let mut task = Task::new("* * * * * * *", None, Some(1), Utc).unwrap();
-        task.add_step_default(|| async { Ok(TaskStepStatusOk::HadErrors) });
+        task.add_step_default(|_ctx| async { Ok(TaskStepStatusOk::HadErrors) });
         task.init();
-        assert!(task.run_task().await.is_ok());
+        assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.step_states[0].status, StepStatus::HadErrors);
         assert_eq!(task.run_outcome(), RunOutcome::HadErrors);
     }
@@ -1698,7 +1840,7 @@ mod test {
         let mut task = Task::new("* * * * * * *", Some("Hist"), None, Utc).unwrap();
         task.set_id(0);
         task.set_history_limit(2);
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         task.init();
 
         let shared = TaskShared::new(task.history_limit);
@@ -1728,7 +1870,7 @@ mod test {
     async fn test_history_limit_zero_disables_history() {
         let mut task = Task::new("* * * * * * *", None, None, Utc).unwrap();
         task.set_history_limit(0);
-        task.add_step_default(|| async { Ok(Success) });
+        task.add_step_default(|_ctx| async { Ok(Success) });
         task.init();
 
         let shared = TaskShared::new(task.history_limit);
@@ -1751,11 +1893,11 @@ mod test {
         let mut task = Task::new("* * * * * * *", None, Some(1), Utc).unwrap();
         task.set_id(0);
         // Step 0 succeeds immediately.
-        task.add_step("first", || async { Ok(Success) });
+        task.add_step("first", |_ctx| async { Ok(Success) });
         // Step 1 signals that it has been reached, then waits for permission to finish.
         let r = ready.clone();
         let p = proceed.clone();
-        task.add_step("second", move || {
+        task.add_step("second", move |_ctx| {
             let r = r.clone();
             let p = p.clone();
             async move {
@@ -1814,5 +1956,128 @@ mod test {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<RunRecord>(&json).unwrap(), record);
+    }
+
+    /// A step's context reports the task id/name, run id, step index and attempt. (0.5.0)
+    #[tokio::test]
+    async fn test_context_reports_identity() {
+        let seen = Arc::new(Mutex::new(
+            Vec::<(usize, Option<String>, usize, usize, u32)>::new(),
+        ));
+        let s = seen.clone();
+        let mut task = Task::new("* * * * * *", None, Some(1), Local).unwrap();
+        task.set_name("ctx-task");
+        task.set_id(7);
+        task.add_step("first", move |ctx| {
+            let s = s.clone();
+            async move {
+                s.lock().unwrap().push((
+                    ctx.task_id(),
+                    ctx.task_name().map(str::to_string),
+                    ctx.run_id(),
+                    ctx.step_index(),
+                    ctx.attempt(),
+                ));
+                Ok(Success)
+            }
+        });
+        task.init();
+        // Run with an explicit run id, as the scheduler would.
+        assert!(task.run_task(42).await.is_ok());
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            (7, Some("ctx-task".to_string()), 42, 0, 1),
+            "context should carry task id/name, run id, step index and attempt"
+        );
+    }
+
+    /// The per-run store hands values from one step to a later step within the same run,
+    /// and does not leak into the next run. (0.5.0)
+    #[tokio::test]
+    async fn test_run_store_passes_data_between_steps() {
+        let observed = Arc::new(Mutex::new(Vec::<Option<u32>>::new()));
+        let mut task = Task::new("* * * * * *", None, Some(2), Local).unwrap();
+        task.set_id(0);
+        // First step writes a value keyed by the current run id.
+        task.add_step("produce", |ctx| async move {
+            ctx.run_store().set("value", ctx.run_id() as u32 + 1);
+            Ok(Success)
+        });
+        // Second step reads what the first step wrote.
+        let o = observed.clone();
+        task.add_step("consume", move |ctx| {
+            let o = o.clone();
+            async move {
+                o.lock().unwrap().push(ctx.run_store().get::<u32>("value"));
+                Ok(Success)
+            }
+        });
+        task.init();
+
+        // Two runs with distinct run ids; each run gets a fresh store.
+        assert!(task.run_task(0).await.is_ok());
+        assert!(task.reschedule().is_ok());
+        assert!(task.run_task(1).await.is_ok());
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            *observed,
+            vec![Some(1), Some(2)],
+            "each run's store is fresh and visible to later steps in that run"
+        );
+    }
+
+    /// A blackboard attached to the task is visible to every step through its context and
+    /// persists across runs. (0.5.0)
+    #[tokio::test]
+    async fn test_context_blackboard_persists_across_runs() {
+        let board = Blackboard::new();
+        let mut task = Task::new("* * * * * *", None, Some(3), Local).unwrap();
+        task.set_id(0);
+        task.set_blackboard(board.clone());
+        task.add_step("count", |ctx| async move {
+            let n: u32 = ctx.blackboard().get_or_insert("runs", 0);
+            ctx.blackboard().set("runs", n + 1);
+            Ok(Success)
+        });
+        task.init();
+
+        for run_id in 0..3 {
+            assert!(task.run_task(run_id).await.is_ok());
+            let _ = task.reschedule();
+        }
+
+        // The externally-held blackboard reflects every run.
+        assert_eq!(board.get::<u32>("runs"), Some(3));
+    }
+
+    /// The context's attempt counter increments as a failing step is retried. (0.5.0)
+    #[tokio::test]
+    async fn test_context_attempt_increments_on_retry() {
+        use crate::retry::RetryPolicy;
+        let attempts = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let a = attempts.clone();
+        let mut task = Task::new("* * * * * *", None, Some(1), Local).unwrap();
+        task.set_id(0);
+        // Fail the first two attempts (recording each attempt number), succeed on the third.
+        task.set_retry_policy(RetryPolicy::fixed(2, Duration::from_millis(0)));
+        task.add_step("flaky", move |ctx| {
+            let a = a.clone();
+            async move {
+                a.lock().unwrap().push(ctx.attempt());
+                if ctx.attempt() < 3 {
+                    Err(Error)
+                } else {
+                    Ok(Success)
+                }
+            }
+        });
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+        assert_eq!(task.status, Status::Executed);
+        assert_eq!(*attempts.lock().unwrap(), vec![1, 2, 3]);
     }
 }

@@ -34,7 +34,7 @@ In your `Cargo.toml` add:
 
 ```
 [dependencies]
-tasklet = "0.4.1"
+tasklet = "0.5.0"
 ```
 
 To derive `serde` on the observable state types (`TaskState`, `Status`, `RunRecord`,
@@ -42,7 +42,7 @@ To derive `serde` on the observable state types (`TaskState`, `Status`, `RunReco
 
 ```
 [dependencies]
-tasklet = { version = "0.4.1", features = ["serde"] }
+tasklet = { version = "0.5.0", features = ["serde"] }
 ```
 
 > **Upgrading from 0.2.x?** See the [migration notes](#migrating-from-02x-to-030) below —
@@ -53,7 +53,9 @@ tasklet = { version = "0.4.1", features = ["serde"] }
 Find more examples in the [examples](/examples) folder.
 
 Task steps are **asynchronous**: every step is a closure that returns a future, so it can
-`.await` real work (I/O, timers, network calls) without blocking the runtime.
+`.await` real work (I/O, timers, network calls) without blocking the runtime. Each step is
+handed a `TaskContext` (write `|_ctx|` to ignore it) that identifies the run and gives
+access to shared and per-run data - see [Step context and data flow](#step-context-and-data-flow).
 
 ```rust
 use log::info;
@@ -82,11 +84,11 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("1 * * * * * *")
             .description("A simple task")
-            .add_step("Step 1", || async {
+            .add_step("Step 1", |_ctx| async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
             })
-            .add_step("Step 2", move || {
+            .add_step("Step 2", move |_ctx| {
                 // Snapshot per-run state, then move it into the async block so the
                 // returned future is `'static`.
                 let count = exec_count;
@@ -107,6 +109,43 @@ async fn main() {
     scheduler.run().await;
 }
 ```
+
+## Step context and data flow
+
+Every step receives a `TaskContext` for the current attempt. It identifies the run
+(`task_id`, `task_name`, `run_id`, `step_index`, `attempt`) and exposes two typed
+key/value stores:
+
+- **`ctx.blackboard()`** - the task-level [`Blackboard`], shared across every run of the
+  task. Attach one with `.blackboard(...)` on the builder, or share the same blackboard
+  across several tasks to pass data between them.
+- **`ctx.run_store()`** - a fresh store created for each run, so a step can hand values to
+  later steps in the same run without leaking into the next run (an XCom-like scratchpad).
+
+```rust
+use tasklet::task::TaskStepStatusOk::Success;
+use tasklet::{Blackboard, TaskBuilder};
+
+let board = Blackboard::new();
+let _task = TaskBuilder::new(chrono::Local)
+    .every("* * * * * * *")
+    .blackboard(board.clone())
+    .add_step("produce", |ctx| async move {
+        ctx.run_store().set("value", (ctx.run_id() as u32 + 1) * 10);
+        Ok(Success)
+    })
+    .add_step("consume", |ctx| async move {
+        let value = ctx.run_store().get::<u32>("value").unwrap_or(0);
+        // Task-level state survives across runs.
+        let total = ctx.blackboard().get_or_insert("runs", 0u32) + 1;
+        ctx.blackboard().set("runs", total);
+        println!("run {} produced/consumed {} (total runs: {})", ctx.run_id(), value, total);
+        Ok(Success)
+    })
+    .build();
+```
+
+See [`examples/context_and_spawner.rs`](/examples/context_and_spawner.rs) for a runnable demo.
 
 ## Graceful shutdown
 
@@ -155,7 +194,7 @@ let _task = TaskBuilder::new(chrono::Local)
     .on_success(|| async { println!("run succeeded"); })
     .on_failure(|| async { eprintln!("run failed"); })
     .on_finish(|| async { println!("task finished its lifecycle"); })
-    .add_step("Step", || async { Ok(Success) })
+    .add_step("Step", |_ctx| async { Ok(Success) })
     .build();
 ```
 
@@ -185,7 +224,7 @@ run is still in progress, the `OverlapPolicy` decides what happens (added in 0.3
 let _task = TaskBuilder::new(chrono::Local)
     .every("* * * * * * *")
     .overlap(OverlapPolicy::Queue)
-    .add_step("Step", || async { Ok(Success) })
+    .add_step("Step", |_ctx| async { Ok(Success) })
     .build();
 ```
 
@@ -265,7 +304,7 @@ scheduler
         TaskBuilder::new(chrono::Local)
             .every("* * * * * * *")
             .name("report")
-            .add_step("Step", || async { Ok(Success) })
+            .add_step("Step", |_ctx| async { Ok(Success) })
             .build(),
     )
     .unwrap();
@@ -291,7 +330,39 @@ scheduler.run().await;
 ```
 
 Every `TaskState` from `handle.statuses()` now also carries the task's `name`, whether it
-is `paused`, its `run_count` and its `last_outcome`.
+is `paused`, its `run_count` and its `last_outcome`. The registry is populated when a task
+is added, so the handle can observe and control tasks before `run()` is even called.
+
+## Adding tasks at runtime
+
+The `SchedulerHandle` is type-erased and cannot carry a `Task<T>`. To add tasks to a
+*running* scheduler, grab a `TaskSpawner` with `scheduler.spawner()` before running. It is
+cloneable and `Send`, so you can hand fully-built tasks to the scheduler from anywhere
+(added in 0.5.0):
+
+```rust,no_run
+# use tasklet::{TaskBuilder, TaskScheduler};
+# use tasklet::task::TaskStepStatusOk::Success;
+# #[tokio::main]
+# async fn main() {
+let mut scheduler = TaskScheduler::default(chrono::Local);
+let spawner = scheduler.spawner();
+
+tokio::spawn(async move {
+    let task = TaskBuilder::new(chrono::Local)
+        .every("* * * * * * *")
+        .add_step("Step", |_ctx| async { Ok(Success) })
+        .build();
+    // Fire-and-forget, or use `spawn_get_id(...).await` to get the assigned id.
+    let _ = spawner.spawn(task);
+});
+
+scheduler.run().await;
+# }
+```
+
+Spawned tasks are picked up on the scheduler's next round, so they are processed only while
+the scheduler is running (like tasks produced by a `TaskGenerator`).
 
 ## Sharing data between tasks
 
@@ -314,6 +385,26 @@ assert_eq!(board.get::<u32>("attempts"), Some(3));
 See [`examples/control_and_observability.rs`](/examples/control_and_observability.rs) for a
 runnable demo combining names, control, history and a shared blackboard.
 
+## Migrating from 0.4.x to 0.5.0
+
+- **Steps now receive a `TaskContext`.** The step closure signature changed from
+  `FnMut() -> Future` to `FnMut(TaskContext) -> Future`. Add a parameter to every step; if
+  you do not need it, ignore it with `|_ctx|`:
+
+  ```rust,ignore
+  // 0.4.x
+  .add_step("Step", || async { Ok(Success) })
+  // 0.5.0
+  .add_step("Step", |_ctx| async { Ok(Success) })
+  ```
+
+  Lifecycle callbacks (`on_success` / `on_failure` / `on_finish`) are unchanged - they
+  still take `|| async { ... }`. The context gives steps access to a shared `Blackboard`
+  and a per-run store; see [Step context and data flow](#step-context-and-data-flow).
+- **New, additive:** `TaskBuilder::blackboard(...)` attaches a shared blackboard;
+  `TaskScheduler::spawner()` returns a `TaskSpawner` for adding tasks to a running
+  scheduler; the observable registry is now populated at `add_task` time.
+
 ## Migrating from 0.2.x to 0.3.0
 
 - **Steps are now async.** A step closure must return a future. Wrap synchronous bodies
@@ -323,7 +414,7 @@ runnable demo combining names, control, history and a shared blackboard.
   // 0.2.x
   .add_step("Step", || Ok(Success))
   // 0.3.0
-  .add_step("Step", || async { Ok(Success) })
+  .add_step("Step", |_ctx| async { Ok(Success) })
   ```
 
   For state that changes between runs, snapshot it in the (`FnMut`) closure and `move` the
