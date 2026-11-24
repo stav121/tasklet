@@ -1249,6 +1249,22 @@ mod test {
         builder.build()
     }
 
+    /// Build a task that counts its runs and is never due on its own (2099), for tests
+    /// that must control every dispatch.
+    fn never_due_counting_task(counter: &Arc<AtomicUsize>) -> TaskResult<Task<Local>> {
+        let c = counter.clone();
+        TaskBuilder::new(Local)
+            .every("0 0 0 1 1 * 2099")
+            .add_step_default(move |_ctx| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(Success)
+                }
+            })
+            .build()
+    }
+
     /// A finite task runs the expected number of times and is then reaped. (X1)
     #[tokio::test]
     async fn test_scheduler_runs_finite_task_and_reaps() {
@@ -1657,7 +1673,11 @@ mod test {
     async fn test_control_pause_and_resume() {
         let counter = Arc::new(AtomicUsize::new(0));
         let mut scheduler = TaskScheduler::new(1000, Local);
-        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        // Never due on its own, so only the forced times below can dispatch it. A
+        // per-second schedule could come due during the sleep on a slow machine.
+        scheduler
+            .add_task(never_due_counting_task(&counter))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Populate the registry so the handle can address the task.
         scheduler.dispatch_round();
@@ -1691,9 +1711,12 @@ mod test {
     async fn test_control_trigger_runs_idle_task() {
         let counter = Arc::new(AtomicUsize::new(0));
         let mut scheduler = TaskScheduler::new(1000, Local);
-        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        // Never due on its own, so the only run is the triggered one.
+        scheduler
+            .add_task(never_due_counting_task(&counter))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // Populate the registry; the task is not due for ~1s.
+        // Populate the registry.
         scheduler.dispatch_round();
 
         let handle = scheduler.handle();
@@ -2423,9 +2446,11 @@ mod test {
             "expected 2+ runs, got {}",
             history.len()
         );
+        // With the one-minute idle wait, only a timer aimed at the slot can start these
+        // runs inside the window. The bound leaves room for a slow CI runner.
         for record in &history {
             let late_ms = record.started_at.timestamp_subsec_millis();
-            assert!(late_ms < 200, "run started {late_ms} ms after its slot");
+            assert!(late_ms < 500, "run started {late_ms} ms after its slot");
         }
     }
 
@@ -2662,20 +2687,45 @@ mod test {
             .add_task_get_id(sleeping_task(30_000, &runs).build())
             .unwrap();
         let waiter_runs = Arc::new(AtomicUsize::new(0));
+        let w = waiter_runs.clone();
+        // Never due on its own: it only runs when triggered below, after the blocker
+        // already holds the single permit. Letting both come due on the same slot would
+        // make the outcome depend on which driver reaches the semaphore first.
         let waiter = scheduler
-            .add_task_get_id(counting_task(&waiter_runs, None))
+            .add_task_get_id(
+                TaskBuilder::new(Local)
+                    .every("0 0 0 1 1 * 2099")
+                    .add_step_default(move |_ctx| {
+                        let w = w.clone();
+                        async move {
+                            w.fetch_add(1, Ordering::SeqCst);
+                            Ok(Success)
+                        }
+                    })
+                    .build(),
+            )
             .unwrap();
         let probe = scheduler.handle();
+        let saw_waiting = Arc::new(AtomicBool::new(false));
+        let seen = saw_waiting.clone();
         tokio::spawn(async move {
+            while !probe.state_of(blocker).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.trigger(waiter);
             while !probe.state_of(waiter).is_some_and(|s| s.waiting) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            seen.store(true, Ordering::SeqCst);
             probe.remove(waiter);
-            let _ = blocker;
         });
         scheduler
             .run_until(tokio::time::sleep(Duration::from_millis(1800)))
             .await;
+        assert!(
+            saw_waiting.load(Ordering::SeqCst),
+            "the waiter never waited"
+        );
         assert_eq!(waiter_runs.load(Ordering::SeqCst), 0);
     }
 
@@ -2735,8 +2785,10 @@ mod test {
     async fn test_exhausted_generator_is_dropped() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        // A single slot, one second from now.
-        let slot = Local::now() + chrono::Duration::seconds(1);
+        // A single slot, two seconds from now (truncated to the second, so 1-2 s away).
+        // One second would leave a slow machine no time to build the generator before
+        // the slot has passed.
+        let slot = Local::now() + chrono::Duration::seconds(2);
         let expression = slot.format("%S %M %H %d %m * %Y").to_string();
         let mut scheduler = TaskScheduler::new(100, Local);
         scheduler.set_task_gen(
@@ -2747,7 +2799,7 @@ mod test {
             .unwrap(),
         );
         scheduler
-            .run_until(tokio::time::sleep(Duration::from_millis(2500)))
+            .run_until(tokio::time::sleep(Duration::from_millis(3500)))
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the single slot ran once");
         assert!(
@@ -2947,12 +2999,25 @@ mod test {
             .unwrap();
         let probe = handle.clone();
         let fresh = runtime.block_on(async move {
+            // The scheduler stops only after the observer has read the state, so a slow
+            // machine cannot make the read happen after shutdown cleared the registry.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let observer = tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                probe.state_of(0).unwrap().next_exec.unwrap()
+                // The first scheduler round restarts the task; wait until it has
+                // published a fresh time.
+                loop {
+                    let next = probe.state_of(0).unwrap().next_exec.unwrap();
+                    if next != stale {
+                        let _ = done_tx.send(());
+                        return next;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
             });
             scheduler
-                .run_until(tokio::time::sleep(Duration::from_millis(60)))
+                .run_until(async {
+                    let _ = done_rx.await;
+                })
                 .await;
             observer.await.unwrap()
         });

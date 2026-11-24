@@ -3096,6 +3096,11 @@ mod test {
         let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
         task.init();
         assert!(task.slot_passed_since(&(Utc::now() - chrono::Duration::seconds(3))));
+        // Stay clear of a second boundary: the function reads the clock again, and a
+        // boundary crossed in between would make a per-second slot "pass".
+        if Utc::now().timestamp_subsec_millis() > 800 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
         // The next per-second slot after "now" lies in the future.
         assert!(!task.slot_passed_since(&Utc::now()));
     }
