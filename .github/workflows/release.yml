@@ -81,6 +81,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Build
         run: cargo build --verbose --all-targets
 
@@ -89,6 +92,9 @@ jobs:
 
       - name: Doc tests
         run: cargo test --doc --verbose
+
+      - name: Test (serde feature)
+        run: cargo test --features serde --verbose
 
       - name: Dry-run package
         run: cargo publish --dry-run

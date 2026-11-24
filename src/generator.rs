@@ -15,14 +15,18 @@ pub struct TaskGenerator<T>
 where
     T: TimeZone + Send + 'static,
 {
-    /// The discovery function, used to retrieve new tasks.
-    discovery_function: Box<dyn FnMut() -> Option<TaskResult<Task<T>>>>,
+    /// The discovery function, used to retrieve new tasks. It must be `Send` so the
+    /// scheduler that owns the generator can itself be moved across threads.
+    discovery_function: Box<dyn FnMut() -> Option<TaskResult<Task<T>>> + Send>,
     /// The execution schedule.
     schedule: Schedule,
     /// The task generator's timezone.
     timezone: T,
     /// The next execution time.
     pub(crate) next_exec: DateTime<T>,
+    /// Set once the schedule has no further execution; the scheduler then drops the
+    /// generator instead of treating the stale `next_exec` as due forever.
+    pub(crate) exhausted: bool,
 }
 
 /// Implementation of `TaskGenerator`.
@@ -35,8 +39,14 @@ where
     /// # Arguments
     ///
     /// * expression    - A valid cron expression.
-    /// * function      - The discovery function.
     /// * timezone      - The generator's timezone.
+    /// * function      - The discovery function. It runs on the scheduler's loop, so it
+    ///   should return quickly; use a [`TaskSpawner`](crate::TaskSpawner) to add tasks
+    ///   discovered by async work.
+    ///
+    /// A generated task that cannot be added (for example because its name is already
+    /// taken) is logged at `warn` level and reported as
+    /// [`SchedulerEvent::TaskRejected`](crate::SchedulerEvent::TaskRejected).
     ///
     /// # Errors
     ///
@@ -53,7 +63,7 @@ where
     /// ```
     pub fn new<F>(expression: &str, timezone: T, function: F) -> TaskResult<TaskGenerator<T>>
     where
-        F: (FnMut() -> Option<TaskResult<Task<T>>>) + 'static,
+        F: (FnMut() -> Option<TaskResult<Task<T>>>) + Send + 'static,
     {
         // Parse the cron expression a single time and surface any error.
         let schedule: Schedule = expression.parse().map_err(|e| {
@@ -75,13 +85,17 @@ where
             schedule,
             timezone,
             next_exec,
+            exhausted: false,
         })
     }
 
     /// Run the discovery function and reschedule the generation function.
     pub(crate) fn run(&mut self) -> Option<TaskResult<Task<T>>> {
         scheduler_log!(log::Level::Debug, "Executing task discovery function");
-        self.next_exec = self.schedule.upcoming(self.timezone.clone()).next()?;
+        match self.schedule.upcoming(self.timezone.clone()).next() {
+            Some(next) => self.next_exec = next,
+            None => self.exhausted = true,
+        }
         match (self.discovery_function)() {
             Some(t) => {
                 // A task was generated and must be returned.

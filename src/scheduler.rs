@@ -1,7 +1,10 @@
 use crate::errors::{TaskError, TaskResult};
+use crate::events::{SchedulerEvent, EVENT_CAPACITY};
 use crate::generator::TaskGenerator;
+use crate::limits::Limiter;
 use crate::task::{
-    run_task, OverlapPolicy, RunOutcome, RunRecord, Status, StepState, Task, TaskCmd, TaskShared,
+    run_task, FinishReason, RunKind, RunOutcome, RunRecord, SchedulerLinks, Status, StepState,
+    Task, TaskCmd, TaskShared,
 };
 use crate::{scheduler_log, task_log};
 use chrono::prelude::*;
@@ -10,8 +13,15 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+/// The default time stopped tasks get to finish their current run.
+const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// How long to wait for an aborted driver to actually stop before closing its books.
+const ABORT_SETTLE: Duration = Duration::from_millis(100);
 
 /// A request sent from a [`TaskSpawner`] to a running scheduler asking it to add a task.
 ///
@@ -33,9 +43,8 @@ where
 /// an API handler, a signal handler). Obtain one with [`TaskScheduler::spawner`] before
 /// calling [`run`](TaskScheduler::run).
 ///
-/// Spawned tasks are picked up on the next scheduler round, so they are only processed
-/// while the scheduler is running (like tasks produced by a
-/// [`TaskGenerator`](crate::TaskGenerator)).
+/// Spawned tasks are picked up as soon as the scheduler loop wakes, which a spawn
+/// triggers, so they are only processed while the scheduler is running.
 ///
 /// # Examples
 ///
@@ -64,10 +73,11 @@ where
     T: TimeZone + Clone + Send + 'static,
 {
     tx: mpsc::UnboundedSender<SpawnRequest<T>>,
+    wake: Arc<Notify>,
 }
 
 // A manual `Clone` avoids an unnecessary `T: Clone` bound the derive would add: the
-// only field is an `UnboundedSender`, which is always cloneable.
+// fields are an `UnboundedSender` and an `Arc`, which are always cloneable.
 impl<T> Clone for TaskSpawner<T>
 where
     T: TimeZone + Clone + Send + 'static,
@@ -75,6 +85,7 @@ where
     fn clone(&self) -> Self {
         TaskSpawner {
             tx: self.tx.clone(),
+            wake: self.wake.clone(),
         }
     }
 }
@@ -84,27 +95,30 @@ where
     T: TimeZone + Clone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
-    /// Queue a task to be added on the scheduler's next round.
+    /// Queue a task to be added to the running scheduler.
     ///
     /// A build error in `task` is returned immediately. The task is otherwise queued
-    /// fire-and-forget; if it carries a name that collides with an existing task it is
-    /// rejected on the scheduler side (observable via the handle rather than here). Use
-    /// [`spawn_get_id`](Self::spawn_get_id) to await the assigned id or the rejection.
+    /// fire-and-forget; if it is rejected on the scheduler side (duplicate name, unknown
+    /// pool) the rejection is logged and published as
+    /// [`SchedulerEvent::TaskRejected`]. Use [`spawn_get_id`](Self::spawn_get_id) to
+    /// await the assigned id or the rejection.
     ///
-    /// Returns [`TaskError::ExecutionError`] if the scheduler has already stopped.
+    /// Returns [`TaskError::ExecutionError`] once the scheduler has stopped (its
+    /// `run` or `run_until` returned).
     pub fn spawn(&self, task: TaskResult<Task<T>>) -> TaskResult<()> {
         let task = task?;
         self.tx
             .send(SpawnRequest { task, reply: None })
-            .map_err(|_| TaskError::ExecutionError("scheduler is no longer running".to_string()))
+            .map_err(|_| TaskError::ExecutionError("scheduler is no longer running".to_string()))?;
+        self.wake.notify_one();
+        Ok(())
     }
 
     /// Queue a task and await the id the scheduler assigns it.
     ///
-    /// Resolves once the scheduler processes the request on its next round. A build
-    /// error is returned immediately; a duplicate name is reported as
-    /// [`TaskError::DuplicateTaskName`]; a stopped scheduler as
-    /// [`TaskError::ExecutionError`].
+    /// A build error is returned immediately; a duplicate name is reported as
+    /// [`TaskError::DuplicateTaskName`], an unknown pool as [`TaskError::UnknownPool`],
+    /// and a stopped scheduler as [`TaskError::ExecutionError`].
     pub async fn spawn_get_id(&self, task: TaskResult<Task<T>>) -> TaskResult<usize> {
         let task = task?;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -114,30 +128,43 @@ where
                 reply: Some(reply_tx),
             })
             .map_err(|_| TaskError::ExecutionError("scheduler is no longer running".to_string()))?;
+        self.wake.notify_one();
         reply_rx.await.map_err(|_| {
             TaskError::ExecutionError("scheduler dropped the spawn request".to_string())
         })?
     }
 }
 
-/// Handler for a running task.
+/// The scheduler's record of one registered task.
 ///
-/// Holds the task's join handle, the sender used to dispatch runs, and the shared
-/// state the task publishes so the scheduler can observe it without a blocking
-/// request/response round-trip.
-#[derive(Debug)]
-pub struct TaskHandle {
+/// Holds the sender used to dispatch runs, the shared state the task publishes, and
+/// either the driver's join handle or, if the task was added outside a Tokio runtime,
+/// the task itself until the scheduler starts.
+struct TaskHandle<T>
+where
+    T: TimeZone + Send + 'static,
+{
     id: usize,
     name: Option<String>,
-    handle: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
+    unstarted: Option<Task<T>>,
     sender: mpsc::Sender<TaskCmd>,
     shared: Arc<TaskShared>,
-    overlap: OverlapPolicy,
+}
+
+/// A task that was removed and is finishing its current run within the grace period.
+struct Retiring {
+    join: Option<JoinHandle<()>>,
+    shared: Arc<TaskShared>,
+    deadline: Instant,
+    /// Set once the driver has been aborted; its books are closed when it has stopped,
+    /// so a late write from the driver cannot overwrite the cancelled record.
+    aborted: bool,
 }
 
 /// A cheaply-clonable entry shared with [`SchedulerHandle`] so it can observe and
 /// control a task without touching the scheduler-private join handle. Rebuilt from the
-/// live task set at the end of every scheduler round.
+/// live task set whenever the set changes.
 #[derive(Clone, Debug)]
 struct RegEntry {
     id: usize,
@@ -153,21 +180,15 @@ impl RegEntry {
             let state = self.shared.state.lock().unwrap();
             (state.status.clone(), state.next_exec)
         };
-        let last_outcome = self
-            .shared
-            .history
-            .lock()
-            .unwrap()
-            .back()
-            .and_then(|r| r.outcome.clone());
         TaskState {
             id: self.id,
             name: self.name.clone(),
             status,
             next_exec,
             running: self.shared.running.load(Ordering::SeqCst),
+            waiting: self.shared.waiting.load(Ordering::SeqCst),
             paused: self.shared.paused.load(Ordering::SeqCst),
-            last_outcome,
+            last_outcome: self.shared.last_outcome.lock().unwrap().clone(),
             run_count: self.shared.runs.load(Ordering::SeqCst),
         }
     }
@@ -175,8 +196,7 @@ impl RegEntry {
 
 /// A snapshot of a single task's state, as reported by [`SchedulerHandle`].
 ///
-/// This is a read-only view computed from the task's live shared state, refreshed at
-/// the end of every scheduler round.
+/// The values are read from the task's live shared state at the time of the call.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -185,15 +205,19 @@ pub struct TaskState {
     pub id: usize,
     /// The task's unique name, if one was set via [`TaskBuilder::name`](crate::TaskBuilder::name).
     pub name: Option<String>,
-    /// The task's lifecycle status as of the last completed round.
+    /// The task's lifecycle status.
     pub status: Status,
     /// The task's next execution time, normalized to UTC (`None` if not scheduled).
     pub next_exec: Option<DateTime<Utc>>,
     /// Whether a run of this task is currently in progress.
     pub running: bool,
+    /// Whether a run is waiting for a concurrency permit
+    /// ([`TaskScheduler::max_concurrent_runs`] or a pool limit).
+    pub waiting: bool,
     /// Whether the task is currently paused (its schedule is not dispatched).
     pub paused: bool,
-    /// The outcome of the most recent completed run, if any.
+    /// The outcome of the most recent finished run, if any. Kept even when the task's
+    /// history is disabled.
     pub last_outcome: Option<RunOutcome>,
     /// The total number of runs started over the task's lifetime.
     pub run_count: usize,
@@ -203,8 +227,9 @@ pub struct TaskState {
 ///
 /// Obtain one with [`TaskScheduler::handle`] *before* calling
 /// [`TaskScheduler::run`], then call [`SchedulerHandle::shutdown`] from anywhere
-/// (another task, a signal handler, etc.) to request a graceful stop, or query the
-/// live task set with [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`].
+/// (another task, a signal handler, etc.) to request a graceful stop, query the
+/// live task set with [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`],
+/// or receive changes as they happen with [`SchedulerHandle::subscribe`].
 ///
 /// # Examples
 ///
@@ -227,29 +252,64 @@ pub struct TaskState {
 pub struct SchedulerHandle {
     notify: Arc<Notify>,
     registry: Arc<Mutex<Vec<RegEntry>>>,
+    events: broadcast::Sender<SchedulerEvent>,
+    wake: Arc<Notify>,
 }
 
 impl SchedulerHandle {
     /// Request a graceful shutdown of the associated scheduler.
     ///
-    /// The scheduler finishes the current execution round, drains its tasks and
-    /// returns from [`TaskScheduler::run`]. Calling this before the scheduler
-    /// starts is fine — the request is remembered and the loop exits on its first
-    /// idle window.
+    /// The scheduler stops dispatching, asks every task to stop (steps see it through
+    /// [`TaskContext::is_cancelled`](crate::TaskContext::is_cancelled)), waits up to its
+    /// [grace period](TaskScheduler::grace_period) for runs in progress to finish, aborts
+    /// any that are still running, and returns from [`TaskScheduler::run`]. Each task's
+    /// `on_finish` callback fires with [`FinishReason::Shutdown`] unless it was aborted.
+    ///
+    /// Calling this before the scheduler starts is fine: the request is remembered and
+    /// the loop exits right after it starts.
     pub fn shutdown(&self) {
         // `notify_one` stores a permit if there is no current waiter, so a shutdown
         // requested before `run()` reaches its await point is not lost.
         self.notify.notify_one();
     }
 
-    /// The number of tasks currently registered with the scheduler.
+    /// Subscribe to the scheduler's [`SchedulerEvent`]s.
     ///
-    /// The value reflects the most recently completed round.
+    /// The receiver gets every event published after this call. See
+    /// [`events`](crate::events) for the delivery guarantees.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::{SchedulerEvent, TaskBuilder, TaskScheduler};
+    /// # use tasklet::task::TaskStepStatusOk::Success;
+    /// # tokio_test::block_on(async {
+    /// let mut scheduler = TaskScheduler::new(50, chrono::Utc);
+    /// let mut events = scheduler.handle().subscribe();
+    /// scheduler
+    ///     .add_task(
+    ///         TaskBuilder::new(chrono::Utc)
+    ///             .every("* * * * * * *")
+    ///             .add_step_default(|_ctx| async { Ok(Success) })
+    ///             .build(),
+    ///     )
+    ///     .unwrap();
+    /// assert!(matches!(
+    ///     events.recv().await,
+    ///     Ok(SchedulerEvent::TaskAdded { task_id: 0, .. })
+    /// ));
+    /// # });
+    /// ```
+    pub fn subscribe(&self) -> broadcast::Receiver<SchedulerEvent> {
+        self.events.subscribe()
+    }
+
+    /// The number of tasks currently registered with the scheduler.
     pub fn task_count(&self) -> usize {
         self.registry.lock().unwrap().len()
     }
 
-    /// A snapshot of every live task's [`TaskState`], as of the last completed round.
+    /// A snapshot of every registered task's [`TaskState`].
     pub fn statuses(&self) -> Vec<TaskState> {
         self.registry
             .lock()
@@ -289,9 +349,13 @@ impl SchedulerHandle {
         self.id_of_name(name).and_then(|id| self.status_of(id))
     }
 
-    /// The recent [`RunRecord`] history of the task with the given id, oldest first.
+    /// The recent [`RunRecord`] history of the task with the given id, oldest first. A
+    /// run in progress appears as a record without `finished_at` and `outcome`.
     ///
-    /// Returns an empty vector if the task is unknown or has no retained history.
+    /// Returns an empty vector if the task is unknown or has no retained history. Once
+    /// the scheduler has stopped no task is registered any more; read the last run from
+    /// [`FinishReport::last_run`](crate::FinishReport::last_run) or the
+    /// [`SchedulerEvent::RunFinished`] events instead.
     pub fn history(&self, id: usize) -> Vec<RunRecord> {
         self.registry
             .lock()
@@ -302,7 +366,8 @@ impl SchedulerHandle {
             .unwrap_or_default()
     }
 
-    /// The per-step state of the last completed run of the task with the given id.
+    /// The per-step state of the task with the given id: live while a run is in
+    /// progress, the final state of the most recent run otherwise.
     ///
     /// Returns an empty vector if the task is unknown.
     pub fn step_states(&self, id: usize) -> Vec<StepState> {
@@ -316,39 +381,89 @@ impl SchedulerHandle {
     }
 
     /// Pause the task with the given id: its schedule stops being dispatched until
-    /// [`resume`](Self::resume) is called. A run already in progress is not interrupted.
+    /// [`resume`](Self::resume) is called. A run already in progress is not interrupted,
+    /// and [`trigger`](Self::trigger) still runs a paused task.
     ///
     /// Returns `true` if the task was found.
     pub fn pause(&self, id: usize) -> bool {
-        self.with_entry(id, |e| e.shared.paused.store(true, Ordering::SeqCst))
+        self.with_entry(id, |e| {
+            e.shared.paused.store(true, Ordering::SeqCst);
+            e.shared.emit(SchedulerEvent::TaskPaused {
+                task_id: e.id,
+                task_name: e.name.clone(),
+            });
+        })
     }
 
-    /// Resume a paused task so its schedule is dispatched again. Returns `true` if the
-    /// task was found.
+    /// Resume a paused task so its schedule is dispatched again.
+    ///
+    /// The task's next execution time is not advanced while it is paused. If that time
+    /// passed during the pause, the task's [`MissedRunPolicy`](crate::MissedRunPolicy)
+    /// decides: the default runs it once straight away; `Skip` drops it if it is later
+    /// than the grace period. Returns `true` if the task was found.
     pub fn resume(&self, id: usize) -> bool {
-        self.with_entry(id, |e| e.shared.paused.store(false, Ordering::SeqCst))
+        let found = self.with_entry(id, |e| {
+            e.shared.paused.store(false, Ordering::SeqCst);
+            e.shared.emit(SchedulerEvent::TaskResumed {
+                task_id: e.id,
+                task_name: e.name.clone(),
+            });
+        });
+        self.wake.notify_one();
+        found
     }
 
-    /// Trigger an immediate run of the task with the given id, regardless of its
-    /// schedule. If a run is already in progress, the trigger is queued to run once the
-    /// current run finishes (at most one queued). Returns `true` if the task was found.
+    /// Run the task with the given id now, regardless of its schedule, whether it is
+    /// paused, and its [`MissedRunPolicy`](crate::MissedRunPolicy). If a run is already
+    /// in progress or about to start, one more run is queued after it (at most one
+    /// queued). Returns `true` if the task was found.
     pub fn trigger(&self, id: usize) -> bool {
         self.with_entry(id, |e| {
-            if e.shared.running.load(Ordering::SeqCst) {
-                e.shared.pending.store(true, Ordering::SeqCst);
-            } else {
-                // Fire-and-forget; a full channel means a run is already queued.
-                let _ = e.sender.try_send(TaskCmd::Run);
+            e.shared.emit(SchedulerEvent::TaskTriggered {
+                task_id: e.id,
+                task_name: e.name.clone(),
+            });
+            let shared = &e.shared;
+            let claim = || {
+                shared
+                    .dispatched
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            };
+            if claim() {
+                // The task is idle, so its single-slot channel is empty.
+                let _ = e.sender.try_send(TaskCmd::Run(RunKind::Triggered));
+                return;
+            }
+            // A run is in flight: queue one more. The driver takes `pending` before it
+            // releases `dispatched` and re-checks it afterwards, but it may have released
+            // the flag between our claim attempt and this store, so try to claim again.
+            // Whoever holds the flag consumes the request; the other side sees it gone.
+            shared.pending.store(true, Ordering::SeqCst);
+            if claim() {
+                if shared.pending.swap(false, Ordering::SeqCst) {
+                    let _ = e.sender.try_send(TaskCmd::Run(RunKind::Triggered));
+                } else {
+                    shared.dispatched.store(false, Ordering::SeqCst);
+                }
             }
         })
     }
 
-    /// Request removal of the task with the given id. The scheduler reaps it on its
-    /// next round. Returns `true` if the task was found.
+    /// Remove the task with the given id.
+    ///
+    /// The task is unregistered on the scheduler's next round. A run in progress is asked
+    /// to stop (through [`TaskContext::is_cancelled`](crate::TaskContext::is_cancelled))
+    /// and gets the scheduler's [grace period](TaskScheduler::grace_period) to finish
+    /// before it is aborted. `on_finish` fires with [`FinishReason::Removed`]. Returns
+    /// `true` if the task was found.
     pub fn remove(&self, id: usize) -> bool {
-        self.with_entry(id, |e| {
-            e.shared.remove_requested.store(true, Ordering::SeqCst)
-        })
+        let found = self.with_entry(id, |e| {
+            e.shared.remove_requested.store(true, Ordering::SeqCst);
+            e.shared.request_stop(FinishReason::Removed);
+        });
+        self.wake.notify_one();
+        found
     }
 
     /// Pause the task registered under the given name. Returns `true` if found.
@@ -372,7 +487,7 @@ impl SchedulerHandle {
             .unwrap_or(false)
     }
 
-    /// Request removal of the task registered under the given name. Returns `true` if found.
+    /// Remove the task registered under the given name. Returns `true` if found.
     pub fn remove_name(&self, name: &str) -> bool {
         self.id_of_name(name)
             .map(|id| self.remove(id))
@@ -395,15 +510,20 @@ impl SchedulerHandle {
 }
 
 /// Task scheduler and executor.
+///
+/// `TaskScheduler` is `Send`, so it can be moved into `tokio::spawn` and driven from a
+/// background task.
 pub struct TaskScheduler<T>
 where
     T: TimeZone + Clone + Send + 'static,
 {
-    /// The task handles from the registered tasks.
-    handles: Vec<TaskHandle>,
+    /// The registered tasks.
+    handles: Vec<TaskHandle<T>>,
+    /// Removed tasks that are still finishing their current run.
+    retiring: Vec<Retiring>,
     /// The (optional) task generation function.
     task_gen: Option<TaskGenerator<T>>,
-    /// The sleep time in ms.
+    /// The longest time the loop sleeps without re-checking, in ms.
     sleep: usize,
     /// The id that should be assigned to the next appended task.
     next_id: usize,
@@ -411,13 +531,16 @@ where
     timezone: T,
     /// Notified when a graceful shutdown is requested.
     shutdown: Arc<Notify>,
-    /// The observable/controllable registry, rebuilt each round and shared with every
-    /// [`SchedulerHandle`].
+    /// The observable/controllable registry shared with every [`SchedulerHandle`].
     registry: Arc<Mutex<Vec<RegEntry>>>,
     /// Sender cloned into every [`TaskSpawner`] handed out via [`spawner`](Self::spawner).
     spawn_tx: mpsc::UnboundedSender<SpawnRequest<T>>,
     /// Receiver drained each round for tasks queued by a [`TaskSpawner`].
     spawn_rx: mpsc::UnboundedReceiver<SpawnRequest<T>>,
+    /// Resources shared with every task: event channel, wake-up signal, limits.
+    links: SchedulerLinks,
+    /// How long stopped tasks get to finish their current run before being aborted.
+    grace: Duration,
 }
 
 /// `TaskScheduler` implementation.
@@ -442,6 +565,7 @@ where
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         TaskScheduler {
             handles: Vec::new(),
+            retiring: Vec::new(),
             /* Originally empty, no registered tasks. */
             task_gen: None,
             sleep: 1000,
@@ -451,10 +575,17 @@ where
             registry: Arc::new(Mutex::new(Vec::new())),
             spawn_tx,
             spawn_rx,
+            links: SchedulerLinks {
+                events: broadcast::channel(EVENT_CAPACITY).0,
+                wake: Arc::new(Notify::new()),
+                limiter: Arc::new(Limiter::default()),
+            },
+            grace: DEFAULT_GRACE_PERIOD,
         }
     }
 
-    /// Return a cloneable [`SchedulerHandle`] that can request a graceful shutdown.
+    /// Return a cloneable [`SchedulerHandle`] to control, observe and shut down the
+    /// scheduler.
     ///
     /// # Examples
     ///
@@ -467,6 +598,8 @@ where
         SchedulerHandle {
             notify: self.shutdown.clone(),
             registry: self.registry.clone(),
+            events: self.links.events.clone(),
+            wake: self.links.wake.clone(),
         }
     }
 
@@ -475,7 +608,7 @@ where
     ///
     /// Unlike [`SchedulerHandle`], a spawner keeps the scheduler's timezone type `T`, so
     /// it can hand fully-built `Task<T>` values to the running loop. Obtain it before
-    /// calling [`run`](Self::run); queued tasks are added on the next round.
+    /// calling [`run`](Self::run).
     ///
     /// # Examples
     ///
@@ -487,21 +620,27 @@ where
     pub fn spawner(&self) -> TaskSpawner<T> {
         TaskSpawner {
             tx: self.spawn_tx.clone(),
+            wake: self.links.wake.clone(),
         }
     }
 
     /// Create a new instance of `TaskScheduler` with no tasks to execute.
     ///
+    /// The scheduler wakes when the next task is due, so `sleep` does not delay runs. It
+    /// is the longest the loop sleeps without re-checking the clock, which bounds how
+    /// late a run can start after the system clock jumps forward.
+    /// [`default`](Self::default) uses 1000 ms.
+    ///
     /// # Arguments
     ///
-    /// * sleep     - The execution frequency (in ms).
+    /// * sleep     - The maximum idle wait (in ms).
     /// * timezone  - The scheduler's timezone.
     ///
     /// # Examples
     ///
     /// ```
     /// # use tasklet::TaskScheduler;
-    /// // Create a new `TaskScheduler` instance that executes every 1000ms.
+    /// // Re-check the clock at least once per second.
     /// let _ = TaskScheduler::new(1000, chrono::Local);
     /// ```
     pub fn new(sleep: usize, timezone: T) -> TaskScheduler<T> {
@@ -509,6 +648,61 @@ where
             sleep,
             ..TaskScheduler::default(timezone)
         }
+    }
+
+    /// Set how long tasks get to finish their current run when they are removed or the
+    /// scheduler shuts down. A run still in progress after that is aborted and recorded
+    /// as [`RunOutcome::Cancelled`]. Defaults to 5 seconds; `Duration::ZERO` aborts at
+    /// once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use tasklet::TaskScheduler;
+    /// let mut scheduler = TaskScheduler::default(chrono::Utc);
+    /// scheduler.grace_period(Duration::from_secs(30));
+    /// ```
+    pub fn grace_period(&mut self, grace: Duration) -> &mut TaskScheduler<T> {
+        self.grace = grace;
+        self
+    }
+
+    /// Limit how many task runs may execute at the same time across the whole
+    /// scheduler. Runs over the limit wait (reported as [`TaskState::waiting`]) until
+    /// another run finishes. Values below 1 are treated as 1.
+    ///
+    /// The limit applies from each task's next run on, including tasks added earlier.
+    /// Calling it again replaces the limit; runs holding a permit from the old limit
+    /// keep it until they finish.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// let mut scheduler = TaskScheduler::default(chrono::Utc);
+    /// scheduler.max_concurrent_runs(4);
+    /// ```
+    pub fn max_concurrent_runs(&mut self, max: usize) -> &mut TaskScheduler<T> {
+        self.links.limiter.set_global(max);
+        self
+    }
+
+    /// Create (or replace) a named concurrency pool. At most `max` runs of tasks in the
+    /// pool (see [`TaskBuilder::pool`](crate::TaskBuilder::pool)) execute at the same
+    /// time. A pool run also counts against [`max_concurrent_runs`](Self::max_concurrent_runs).
+    /// Values below 1 are treated as 1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tasklet::TaskScheduler;
+    /// let mut scheduler = TaskScheduler::default(chrono::Utc);
+    /// scheduler.add_pool("database", 2).add_pool("http", 8);
+    /// ```
+    pub fn add_pool(&mut self, name: &str, max: usize) -> &mut TaskScheduler<T> {
+        self.links.limiter.set_pool(name, max);
+        self
     }
 
     /// Set a `TaskGenerator` instance for the TaskScheduler.
@@ -539,18 +733,19 @@ where
     ///
     /// If the task has a name (set via [`TaskBuilder::name`](crate::TaskBuilder::name)),
     /// it must be unique within the scheduler; a duplicate is rejected with
-    /// [`TaskError::DuplicateTaskName`].
+    /// [`TaskError::DuplicateTaskName`]. A task in a pool that does not exist is rejected
+    /// with [`TaskError::UnknownPool`].
+    ///
+    /// Tasks can be added outside a Tokio runtime; they start when the scheduler runs.
     ///
     /// # Examples
     ///
     /// ```
     /// # use tasklet::{TaskScheduler, Task};
-    /// # tokio_test::block_on( async {
     /// // Create a new `TaskScheduler` and attach a task to it.
     /// let mut scheduler = TaskScheduler::default(chrono::Local);
     /// // Add a task that executes every second forever.
     /// scheduler.add_task(Task::new("* * * * * * *", None, None, chrono::Local)).unwrap();
-    /// # });
     /// ```
     pub fn add_task(
         &mut self,
@@ -566,21 +761,18 @@ where
     /// task's id instead of `&mut Self`, so callers can address an unnamed task
     /// afterwards through a [`SchedulerHandle`] (pause, resume, trigger, remove).
     ///
-    /// If the task has a name (set via [`TaskBuilder::name`](crate::TaskBuilder::name)),
-    /// it must be unique within the scheduler; a duplicate is rejected with
-    /// [`TaskError::DuplicateTaskName`].
+    /// The task is visible through every [`SchedulerHandle`] as soon as this returns,
+    /// with its first execution time already computed.
     ///
     /// # Examples
     ///
     /// ```
     /// # use tasklet::{TaskScheduler, Task};
-    /// # tokio_test::block_on( async {
     /// let mut scheduler = TaskScheduler::default(chrono::Local);
     /// let id = scheduler
     ///     .add_task_get_id(Task::new("* * * * * * *", None, None, chrono::Local))
     ///     .unwrap();
     /// assert_eq!(id, 0);
-    /// # });
     /// ```
     pub fn add_task_get_id(&mut self, task: TaskResult<Task<T>>) -> Result<usize, TaskError> {
         let mut task = task?;
@@ -591,45 +783,86 @@ where
                 return Err(TaskError::DuplicateTaskName(name.to_string()));
             }
         }
+        if let Some(pool) = task.pool.as_deref() {
+            if !self.links.limiter.has_pool(pool) {
+                return Err(TaskError::UnknownPool(pool.to_string()));
+            }
+        }
 
         let id = self.next_id;
 
-        // A buffer of one is enough: the scheduler only dispatches a run when
-        // the task is idle, so at most one `Run` is ever in flight.
+        // A buffer of one is enough: a `Run` is only sent by whoever flips the task's
+        // `dispatched` flag, so at most one is ever in flight.
         let (sender, receiver) = mpsc::channel(1);
 
         task.set_receiver(receiver);
         task.set_id(id);
-        let overlap = task.overlap;
+        // Initialize here rather than in the task's driver so the first execution time
+        // is observable immediately, even before the scheduler runs.
+        task.init();
         let name = task.name.clone();
-        let shared = Arc::new(TaskShared::new(task.history_limit));
-        let handle = tokio::spawn(run_task(task, shared.clone()));
+        let shared = Arc::new(TaskShared::new(&task, self.links.clone()));
 
-        // Push the handle
+        let (join, unstarted) = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => (Some(runtime.spawn(run_task(task, shared.clone()))), None),
+            Err(_) => (None, Some(task)),
+        };
+
         self.handles.push(TaskHandle {
             id,
-            name,
-            handle,
+            name: name.clone(),
+            join,
+            unstarted,
             sender,
             shared,
-            overlap,
         });
-
-        // Increase the id of the next task.
         self.next_id += 1;
 
-        // Publish the new task into the shared registry immediately so a
-        // `SchedulerHandle` can observe and control it before `run()` is called, not
-        // only after the first scheduling round.
+        let _ = self.links.events.send(SchedulerEvent::TaskAdded {
+            task_id: id,
+            task_name: name,
+        });
         self.refresh_registry();
+        self.links.wake.notify_one();
         Ok(id)
+    }
+
+    /// Spawn the drivers of tasks that were added outside a Tokio runtime.
+    fn start_unstarted(&mut self) {
+        for handle in &mut self.handles {
+            if let Some(mut task) = handle.unstarted.take() {
+                // The first execution time was computed when the task was added, which
+                // may be long before the scheduler started; recompute it from now.
+                task.status = Status::Init;
+                handle.join = Some(tokio::spawn(run_task(task, handle.shared.clone())));
+            }
+        }
+    }
+
+    /// Log and publish a task that could not be added.
+    fn reject(&self, task_name: Option<String>, error: &TaskError, source: &str) {
+        scheduler_log!(
+            log::Level::Warn,
+            "Rejected a task from the {} ({}): {}",
+            source,
+            task_name.as_deref().unwrap_or("unnamed"),
+            error
+        );
+        let _ = self.links.events.send(SchedulerEvent::TaskRejected {
+            task_name,
+            reason: error.to_string(),
+        });
     }
 
     /// Add every task queued by a [`TaskSpawner`] since the last round, replying with the
     /// assigned id (or the rejection error) to any caller awaiting one.
     fn drain_spawns(&mut self) {
         while let Ok(request) = self.spawn_rx.try_recv() {
+            let task_name = request.task.name.clone();
             let result = self.add_task_get_id(Ok(request.task));
+            if let Err(error) = &result {
+                self.reject(task_name, error, "spawner");
+            }
             if let Some(reply) = request.reply {
                 // The receiver may have gone away; that is fine.
                 let _ = reply.send(result);
@@ -637,62 +870,98 @@ where
         }
     }
 
-    /// Run a single scheduling round.
-    ///
-    /// Reaps any task that has reached a terminal state, then dispatches a run to
-    /// every task whose next execution time is due. Dispatch is fire-and-forget: the
-    /// scheduler never waits for a task's run to complete, so a slow task cannot
-    /// delay any other task's schedule. The overlap policy decides what to do when a
-    /// task is still running at its next due time.
+    /// Reap tasks that have stopped, start the retirement of removed tasks, abort
+    /// retiring tasks whose grace period ran out, and dispatch a run to every idle task
+    /// that is due. Dispatch is fire-and-forget: the scheduler never waits for a run,
+    /// so a slow task cannot delay any other task's schedule.
     fn dispatch_round(&mut self) {
         let now = Utc::now();
+        let instant_now = Instant::now();
 
-        // Reap tasks that have reached a terminal state or been removed on request.
-        self.handles.retain(|handle| {
-            let finished = handle.shared.finished.load(Ordering::SeqCst);
-            let removed = handle.shared.remove_requested.load(Ordering::SeqCst);
-            if finished || removed {
-                let reason = if removed {
-                    "Removing task on request"
-                } else {
-                    "Removing finished task"
-                };
-                task_log!(handle.id, log::Level::Debug, "{}", reason);
-                handle.handle.abort();
-                false
+        // Split off tasks that finished on their own or were asked to leave.
+        let mut kept = Vec::with_capacity(self.handles.len());
+        for handle in std::mem::take(&mut self.handles) {
+            if handle.shared.finished.load(Ordering::SeqCst) {
+                task_log!(handle.id, log::Level::Debug, "Removing finished task");
+            } else if handle.join.as_ref().is_some_and(|j| j.is_finished()) {
+                // The driver stopped without finishing, which only a panic inside the
+                // scheduler machinery can cause (steps and callbacks are guarded).
+                task_log!(
+                    handle.id,
+                    log::Level::Error,
+                    "Task driver stopped unexpectedly, removing the task"
+                );
+                handle.shared.abandon_run(now);
+                handle.shared.report_removed(FinishReason::Panicked);
+            } else if handle.shared.remove_requested.load(Ordering::SeqCst) {
+                task_log!(handle.id, log::Level::Debug, "Removing task on request");
+                if handle.join.is_none() {
+                    // Never started, so there is no run to wait for.
+                    handle.shared.report_removed(FinishReason::Removed);
+                }
+                self.retiring.push(Retiring {
+                    join: handle.join,
+                    shared: handle.shared,
+                    deadline: instant_now + self.grace,
+                    aborted: false,
+                });
             } else {
-                true
+                kept.push(handle);
             }
+        }
+        self.handles = kept;
+
+        // Abort removed tasks that did not stop within the grace period.
+        self.retiring.retain_mut(|retiring| {
+            let done = retiring.join.as_ref().is_none_or(|j| j.is_finished());
+            if done {
+                // A driver that finished normally already closed its books; these calls
+                // only matter after an abort or a crash.
+                if retiring.aborted || !retiring.shared.finished.load(Ordering::SeqCst) {
+                    close_books(&retiring.shared, now);
+                }
+                return false;
+            }
+            if !retiring.aborted && instant_now >= retiring.deadline {
+                task_log!(
+                    retiring.shared.id,
+                    log::Level::Warn,
+                    "Did not stop within the grace period, aborting"
+                );
+                if let Some(join) = &retiring.join {
+                    join.abort();
+                }
+                retiring.aborted = true;
+                // Look again shortly, once the abort has taken effect.
+                retiring.deadline = instant_now + ABORT_SETTLE;
+            }
+            true
         });
 
         // Dispatch due tasks.
         for handle in &self.handles {
-            // A paused task's schedule is not dispatched.
-            if handle.shared.paused.load(Ordering::SeqCst) {
+            let shared = &handle.shared;
+            if handle.join.is_none()
+                || shared.paused.load(Ordering::SeqCst)
+                || shared.running.load(Ordering::SeqCst)
+            {
                 continue;
             }
-
-            let due = match handle.shared.state.lock().unwrap().next_exec {
+            let due = match shared.state.lock().unwrap().next_exec {
                 Some(next) => now >= next,
                 None => false,
             };
             if !due {
                 continue;
             }
-
-            if handle.shared.running.load(Ordering::SeqCst) {
-                // A previous run is still in progress: apply the overlap policy.
-                match handle.overlap {
-                    OverlapPolicy::Skip => { /* drop this occurrence */ }
-                    OverlapPolicy::Queue => {
-                        handle.shared.pending.store(true, Ordering::SeqCst);
-                    }
-                }
-            } else {
-                // Fire-and-forget. `try_send` never blocks; a full channel means a run
-                // is already queued for this idle task, so dropping the duplicate is
-                // the correct behaviour.
-                let _ = handle.sender.try_send(TaskCmd::Run);
+            // Whoever flips `dispatched` sends the run, so a concurrent trigger cannot
+            // queue a duplicate.
+            if shared
+                .dispatched
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let _ = handle.sender.try_send(TaskCmd::Run(RunKind::Scheduled));
             }
         }
 
@@ -715,43 +984,144 @@ where
         *self.registry.lock().unwrap() = snapshot;
     }
 
-    /// Execute the `TaskGenerator` instance (if set).
+    /// Execute the `TaskGenerator` instance (if set and due).
     ///
-    /// This function will spawn the task, create its handle and attach it to the scheduler.
+    /// A generated task is added like any other; one that cannot be added is logged
+    /// and published as [`SchedulerEvent::TaskRejected`].
     fn run_task_gen(&mut self) -> bool {
-        match self.task_gen {
-            Some(ref mut tg) => {
-                // Execute only if it's time to execute it.
-                if tg.next_exec <= Utc::now().with_timezone(&self.timezone) {
-                    return match tg.run() {
-                        Some(t) => {
-                            let _ = self.add_task(t);
-                            true
-                        }
-                        None => false,
-                    };
+        let generated = match self.task_gen {
+            Some(ref mut tg) if tg.next_exec <= Utc::now().with_timezone(&self.timezone) => {
+                tg.run()
+            }
+            _ => return false,
+        };
+        if self.task_gen.as_ref().is_some_and(|tg| tg.exhausted) {
+            scheduler_log!(
+                log::Level::Info,
+                "Task generator has no further execution and was removed"
+            );
+            self.task_gen = None;
+        }
+        match generated {
+            Some(Ok(task)) => {
+                let task_name = task.name.clone();
+                match self.add_task_get_id(Ok(task)) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.reject(task_name, &error, "generator");
+                        false
+                    }
                 }
+            }
+            Some(Err(error)) => {
+                self.reject(None, &error, "generator");
                 false
             }
             None => false,
         }
     }
 
-    /// Abort every registered task and clear the handle list.
-    ///
-    /// Used on shutdown to drain the scheduler cleanly. Each task is just parked on
-    /// its receiver, so aborting is safe.
-    fn shutdown_tasks(&mut self) {
+    /// When the loop must next wake up: the earliest due time of an idle task, the
+    /// generator, or a retiring task's deadline, capped at the maximum idle wait.
+    fn next_wake(&self) -> Instant {
+        let instant_now = Instant::now();
+        let mut wake = instant_now + Duration::from_millis(self.sleep as u64);
+
+        let utc_now = Utc::now();
+        let to_instant = |at: DateTime<Utc>| {
+            // A time in the past means "now"; the round that follows dispatches it.
+            instant_now
+                + at.signed_duration_since(utc_now)
+                    .to_std()
+                    .unwrap_or_default()
+        };
+
         for handle in &self.handles {
-            handle.handle.abort();
+            let shared = &handle.shared;
+            // Busy and paused tasks report back through the wake signal when they
+            // become dispatchable, so they do not need a timer.
+            if handle.join.is_none()
+                || shared.paused.load(Ordering::SeqCst)
+                || shared.running.load(Ordering::SeqCst)
+                || shared.dispatched.load(Ordering::SeqCst)
+            {
+                continue;
+            }
+            if let Some(next) = shared.state.lock().unwrap().next_exec {
+                wake = wake.min(to_instant(next));
+            }
         }
-        self.handles.clear();
-        self.registry.lock().unwrap().clear();
+        if let Some(tg) = &self.task_gen {
+            wake = wake.min(to_instant(tg.next_exec.with_timezone(&Utc)));
+        }
+        for retiring in &self.retiring {
+            wake = wake.min(retiring.deadline);
+        }
+        wake
     }
 
-    /// Run one iteration of the scheduler flow: run the generator (if due) and
-    /// dispatch the current round. Newly generated tasks initialize themselves.
+    /// Stop every task: ask each to stop, wait up to the grace period for runs in
+    /// progress, then abort whatever is left.
+    async fn drain(&mut self) {
+        for handle in &self.handles {
+            handle.shared.request_stop(FinishReason::Shutdown);
+        }
+        for retiring in &self.retiring {
+            retiring.shared.cancel.cancel();
+        }
+
+        let deadline = Instant::now() + self.grace;
+        let drivers = std::mem::take(&mut self.handles)
+            .into_iter()
+            .map(|h| (h.join, h.shared, deadline))
+            .chain(
+                std::mem::take(&mut self.retiring)
+                    .into_iter()
+                    // A removed task keeps the deadline it already had.
+                    .map(|r| (r.join, r.shared, r.deadline.min(deadline))),
+            );
+        for (join, shared, deadline) in drivers {
+            let Some(mut join) = join else {
+                // Never started.
+                shared.report_removed(shared.stop_reason());
+                continue;
+            };
+            match tokio::time::timeout_at(deadline, &mut join).await {
+                Ok(Ok(())) => {}
+                // The driver panicked or was aborted earlier.
+                Ok(Err(_)) => close_books(&shared, Utc::now()),
+                Err(_) => {
+                    task_log!(
+                        shared.id,
+                        log::Level::Warn,
+                        "Did not stop within the grace period, aborting"
+                    );
+                    join.abort();
+                    // Let the abort take effect so the driver cannot write after the
+                    // books are closed.
+                    let _ = tokio::time::timeout(ABORT_SETTLE, &mut join).await;
+                    close_books(&shared, Utc::now());
+                }
+            }
+        }
+        self.registry.lock().unwrap().clear();
+
+        // A spawner used after this point gets an error instead of a request that is
+        // never processed.
+        self.spawn_rx.close();
+        while let Ok(request) = self.spawn_rx.try_recv() {
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Err(TaskError::ExecutionError(
+                    "scheduler is no longer running".to_string(),
+                )));
+            }
+        }
+    }
+
+    /// Run one iteration of the scheduler flow: start tasks added outside the runtime,
+    /// run the generator (if due), add spawned tasks and dispatch the current round.
     fn tick(&mut self) {
+        self.start_unstarted();
         self.run_task_gen();
         self.drain_spawns();
         self.dispatch_round();
@@ -762,9 +1132,6 @@ where
     /// Executes the main flow of the scheduler until a shutdown is requested through a
     /// [`SchedulerHandle`] obtained via [`TaskScheduler::handle`]. If no handle is ever
     /// used to request a shutdown, this runs forever.
-    ///
-    /// At first all the tasks are initialized and then the execution loop is entered.
-    /// If a task generation/discovery method is provided, it is executed on every loop.
     ///
     /// # Examples
     ///
@@ -787,8 +1154,12 @@ where
     ///
     /// This is the general form of [`TaskScheduler::run`]; it lets callers drive the
     /// shutdown with any future, for example an OS signal such as `ctrl_c`. When the
-    /// future resolves the current round finishes, the tasks are drained and this
-    /// returns.
+    /// future resolves the scheduler stops gracefully, as described on
+    /// [`SchedulerHandle::shutdown`], and this returns.
+    ///
+    /// The loop sleeps until the next task is due and wakes early when a task is added,
+    /// spawned, resumed, removed or finishes a run, so runs start on time rather than
+    /// on the next polling tick.
     ///
     /// # Examples
     ///
@@ -812,49 +1183,48 @@ where
             "Scheduler started with {} task(s) in queue",
             self.handles.len()
         );
+        let _ = self.links.events.send(SchedulerEvent::SchedulerStarted);
 
         tokio::pin!(shutdown);
-
-        // Tasks initialize themselves when spawned, so there is no separate init phase.
-
-        // Drive the loop with an `Interval` rather than sleeping for a fixed amount
-        // *after* each round. `sleep` would add the duration of `tick()` to every
-        // cycle, so the poll cadence would slowly drift and long rounds could push
-        // ticks past their intended time. An interval anchors ticks to a fixed
-        // wall-clock cadence; `Skip` collapses missed ticks (when a round overruns
-        // the period) instead of firing a burst of catch-up ticks. (B7)
-        let mut interval = tokio::time::interval(Duration::from_millis(self.sleep as u64));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let wake = self.links.wake.clone();
 
         loop {
-            // Wake up on either a due tick or a shutdown request, whichever comes
-            // first. The first `interval.tick()` resolves immediately, so the first
-            // round runs without delay.
+            self.tick();
+            let deadline = self.next_wake();
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
                     scheduler_log!(log::Level::Info, "Shutdown requested, stopping scheduler");
                     break;
                 }
-                _ = interval.tick() => {
-                    self.tick();
-                }
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
             }
         }
 
-        self.shutdown_tasks();
+        self.drain().await;
         scheduler_log!(log::Level::Info, "Scheduler stopped");
+        let _ = self.links.events.send(SchedulerEvent::SchedulerStopped);
     }
+}
+
+/// Close the books of a task whose driver was aborted or stopped unexpectedly: a run
+/// in progress is recorded as cancelled and the task's removal is published.
+fn close_books(shared: &TaskShared, now: DateTime<Utc>) {
+    shared.abandon_run(now);
+    shared.report_removed(shared.stop_reason());
+    shared.finished.store(true, Ordering::SeqCst);
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::task::StepStatus;
     use crate::task::TaskStepStatusErr::ErrorDelete;
     use crate::task::TaskStepStatusOk::Success;
+    use crate::task::{MissedRunPolicy, OverlapPolicy, StepStatus, TaskStepStatusErr};
     use crate::TaskBuilder;
     use chrono::Local;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -963,15 +1333,14 @@ mod test {
         );
     }
 
-    /// `dispatch_round` does not start a new run when one is in progress under Skip. (X1)
+    /// `dispatch_round` never sends a run to a task whose previous run is still in
+    /// progress; overlap is decided by the task itself when the run ends. (X1)
     #[tokio::test]
     async fn test_dispatch_skips_running_task() {
         let mut scheduler = TaskScheduler::new(1000, Local);
         scheduler
             .add_task(Task::new("* * * * * * *", None, None, Local))
             .unwrap();
-        // Allow the task to self-initialize.
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Simulate a due task whose previous run is still in progress.
         {
@@ -982,31 +1351,9 @@ mod test {
         }
         scheduler.dispatch_round();
 
-        // Skip: nothing is queued.
-        assert!(!scheduler.handles[0].shared.pending.load(Ordering::SeqCst));
-    }
-
-    /// `dispatch_round` queues a missed occurrence when the policy is Queue. (X1)
-    #[tokio::test]
-    async fn test_dispatch_queues_running_task() {
-        let mut scheduler = TaskScheduler::new(1000, Local);
-        let task = TaskBuilder::new(Local)
-            .every("* * * * * * *")
-            .overlap(OverlapPolicy::Queue)
-            .build();
-        scheduler.add_task(task).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        {
-            let shared = &scheduler.handles[0].shared;
-            shared.running.store(true, Ordering::SeqCst);
-            shared.state.lock().unwrap().next_exec =
-                Some(Utc::now() - chrono::Duration::seconds(1));
-        }
-        scheduler.dispatch_round();
-
-        // Queue: the missed occurrence is recorded.
-        assert!(scheduler.handles[0].shared.pending.load(Ordering::SeqCst));
+        let shared = &scheduler.handles[0].shared;
+        assert!(!shared.dispatched.load(Ordering::SeqCst));
+        assert!(!shared.pending.load(Ordering::SeqCst));
     }
 
     /// `dispatch_round` dispatches a run to an idle, due task. (X1)
@@ -1034,7 +1381,7 @@ mod test {
         let mut scheduler = TaskScheduler::new(100, Local);
 
         let mut doomed = Task::new("* * * * * * *", None, None, Local).unwrap();
-        doomed.add_step_default(|_ctx| async { Err(ErrorDelete) });
+        doomed.add_step_default(|_ctx| async { Err(ErrorDelete("fatal".to_string())) });
         scheduler.add_task(Ok(doomed)).unwrap();
         scheduler.add_task(counting_task(&survivor, None)).unwrap();
 
@@ -1479,6 +1826,7 @@ mod test {
             status: Status::Scheduled,
             next_exec: None,
             running: false,
+            waiting: false,
             paused: true,
             last_outcome: Some(RunOutcome::Success),
             run_count: 5,
@@ -1586,5 +1934,1028 @@ mod test {
             matches!(result, Err(TaskError::DuplicateTaskName(name)) if name == "dup"),
             "a duplicate name must be rejected on the scheduler side"
         );
+    }
+
+    /// Collect every event already published on `rx`.
+    fn drain_events(rx: &mut broadcast::Receiver<SchedulerEvent>) -> Vec<SchedulerEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// A step that sleeps for `ms` and counts its runs.
+    fn sleeping_task(ms: u64, runs: &Arc<AtomicUsize>) -> TaskBuilder<Local> {
+        let r = runs.clone();
+        TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .add_step("sleep", move |_ctx| {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(Success)
+                }
+            })
+    }
+
+    /// `TaskScheduler` is `Send` and can be driven from `tokio::spawn`. (F3)
+    #[tokio::test]
+    async fn test_scheduler_is_send_and_spawnable() {
+        fn assert_send<X: Send>(_: &X) {}
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        // A generator closure no longer prevents `Send`.
+        scheduler.set_task_gen(TaskGenerator::new("0 0 0 1 1 * 2099", Local, || None).unwrap());
+        scheduler
+            .add_task(counting_task(&counter, Some(1)))
+            .unwrap();
+        assert_send(&scheduler);
+
+        let handle = scheduler.handle();
+        let driver = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("spawned scheduler did not stop")
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Tasks can be added outside a Tokio runtime; they start when the scheduler runs. (F5)
+    #[test]
+    fn test_add_task_outside_runtime() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let id = scheduler
+            .add_task_get_id(counting_task(&counter, Some(1)))
+            .unwrap();
+        let handle = scheduler.handle();
+        // Already initialized and observable before any runtime exists.
+        let state = handle.state_of(id).unwrap();
+        assert_eq!(state.status, Status::Scheduled);
+        assert!(state.next_exec.is_some());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            scheduler
+                .run_until(tokio::time::sleep(Duration::from_millis(1300)))
+                .await;
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Removing a task that was never started reports it as removed. (F5, F2)
+    #[test]
+    fn test_remove_unstarted_task() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        assert!(handle.remove(0));
+        scheduler.dispatch_round();
+        assert_eq!(handle.task_count(), 0);
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRemoved {
+                task_id: 0,
+                reason: FinishReason::Removed,
+                ..
+            }
+        )));
+    }
+
+    /// Shutdown waits for a run in progress to finish, records it, and fires
+    /// `on_finish` with `Shutdown`. (P1, F1)
+    #[tokio::test]
+    async fn test_shutdown_waits_for_run_in_progress() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let f = finished.clone();
+        let r = reasons.clone();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let task = sleeping_task(400, &runs)
+            .add_step("after", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    f.fetch_add(1, Ordering::SeqCst);
+                    Ok(Success)
+                }
+            })
+            .on_finish(move |report| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push(report.reason) }
+            })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let handle = scheduler.handle();
+        let probe = handle.clone();
+        let stopper = tokio::spawn(async move {
+            // Wait until the first run is in progress, then stop.
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let history = probe.history(id);
+            probe.shutdown();
+            history
+        });
+        tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+            .await
+            .expect("scheduler did not stop");
+        let history_mid_run = stopper.await.unwrap();
+
+        assert_eq!(history_mid_run.len(), 1);
+        assert_eq!(history_mid_run[0].outcome, None, "in progress when stopped");
+        // The step that was running completed; the next step saw the stop request and
+        // did not start.
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        assert_eq!(*reasons.lock().unwrap(), vec![FinishReason::Shutdown]);
+        assert_eq!(scheduler.handles.len(), 0);
+    }
+
+    /// A step that ignores the stop request is aborted once the grace period ends, and
+    /// its run is recorded as cancelled. (P1, F1)
+    #[tokio::test]
+    async fn test_shutdown_aborts_after_grace_period() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.grace_period(Duration::from_millis(100));
+        let id = scheduler
+            .add_task_get_id(sleeping_task(30_000, &runs).build())
+            .unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        let probe = handle.clone();
+        let stopper = tokio::spawn(async move {
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.shutdown();
+        });
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+            .await
+            .expect("scheduler did not stop");
+        stopper.await.unwrap();
+        // The scheduler waited about one grace period after the request, not 30 s.
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRemoved {
+                reason: FinishReason::Shutdown,
+                ..
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SchedulerEvent::RunFinished { .. })),
+            "the aborted run never finished"
+        );
+    }
+
+    /// A step that watches for cancellation stops at once on shutdown; its run is
+    /// recorded as cancelled and the scheduler does not wait for the grace period. (P1)
+    #[tokio::test]
+    async fn test_shutdown_cooperative_step_stops_early() {
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.grace_period(Duration::from_secs(30));
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .add_step("wait", |ctx| async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => Ok(Success),
+                    _ = ctx.cancelled() => Err(TaskStepStatusErr::error("stopped")),
+                }
+            })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        let probe = handle.clone();
+        let o = outcomes.clone();
+        let stopper = tokio::spawn(async move {
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.shutdown();
+            o.lock().unwrap().push(());
+        });
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+            .await
+            .expect("scheduler did not stop");
+        stopper.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let report = drain_events(&mut events)
+            .into_iter()
+            .find_map(|e| match e {
+                SchedulerEvent::RunFinished { report } => Some(report),
+                _ => None,
+            })
+            .expect("the run finished");
+        assert_eq!(report.record.outcome, Some(RunOutcome::Cancelled));
+        assert_eq!(report.steps[0].status, StepStatus::Cancelled);
+    }
+
+    /// Removing a task mid-run lets the run finish, then fires `on_finish` with
+    /// `Removed`. (P1, F2)
+    #[tokio::test]
+    async fn test_remove_lets_run_finish() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let r = reasons.clone();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let task = sleeping_task(300, &runs)
+            .on_finish(move |report| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push((report.reason, report.last_run)) }
+            })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        let probe = handle.clone();
+        let remover = tokio::spawn(async move {
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(probe.remove(id));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            probe.task_count()
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2500)))
+            .await;
+        assert_eq!(remover.await.unwrap(), 0, "unregistered on the next round");
+
+        let reasons = reasons.lock().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].0, FinishReason::Removed);
+        assert_eq!(
+            reasons[0].1.as_ref().and_then(|r| r.outcome.clone()),
+            Some(RunOutcome::Success),
+            "the run in progress completed"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no run after removal");
+        let removed: Vec<_> = drain_events(&mut events)
+            .into_iter()
+            .filter(|e| matches!(e, SchedulerEvent::TaskRemoved { .. }))
+            .collect();
+        assert_eq!(removed.len(), 1);
+    }
+
+    /// A removed task that ignores the stop request is aborted after the grace period
+    /// while the scheduler keeps running. (P1, F2)
+    #[tokio::test]
+    async fn test_remove_aborts_after_grace_period() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.grace_period(Duration::from_millis(100));
+        let id = scheduler
+            .add_task_get_id(sleeping_task(30_000, &runs).build())
+            .unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        let probe = handle.clone();
+        tokio::spawn(async move {
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.remove(id);
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1800)))
+            .await;
+        let events = drain_events(&mut events);
+        let removed_at = events.iter().position(|e| {
+            matches!(
+                e,
+                SchedulerEvent::TaskRemoved {
+                    reason: FinishReason::Removed,
+                    ..
+                }
+            )
+        });
+        assert!(
+            removed_at.is_some(),
+            "the task was aborted and reported removed"
+        );
+        assert!(scheduler.retiring.is_empty(), "aborted before shutdown");
+    }
+
+    /// The event stream reports a task's whole life in order. (P2)
+    #[tokio::test]
+    async fn test_event_stream_lifecycle() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let mut events = scheduler.handle().subscribe();
+        scheduler
+            .add_task(counting_task(&counter, Some(1)))
+            .unwrap();
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1500)))
+            .await;
+
+        let kinds: Vec<&'static str> = drain_events(&mut events)
+            .iter()
+            .map(|e| match e {
+                SchedulerEvent::SchedulerStarted => "scheduler-started",
+                SchedulerEvent::SchedulerStopped => "scheduler-stopped",
+                SchedulerEvent::TaskAdded { .. } => "added",
+                SchedulerEvent::RunStarted { .. } => "run-started",
+                SchedulerEvent::StepStarted { .. } => "step-started",
+                SchedulerEvent::StepFinished { .. } => "step-finished",
+                SchedulerEvent::RunFinished { .. } => "run-finished",
+                SchedulerEvent::TaskRemoved { reason, .. } => {
+                    assert_eq!(*reason, FinishReason::Completed);
+                    "removed"
+                }
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "added",
+                "scheduler-started",
+                "run-started",
+                "step-started",
+                "step-finished",
+                "run-finished",
+                "removed",
+                "scheduler-stopped"
+            ]
+        );
+    }
+
+    /// Pause, resume and trigger publish events. (P2, F11)
+    #[tokio::test]
+    async fn test_control_events() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler.add_task(counting_task(&counter, None)).unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        handle.pause(0);
+        // Trigger runs a paused task.
+        handle.trigger(0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.resume(0);
+        assert!(!handle.pause(42));
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "trigger ran the paused task"
+        );
+        let events = drain_events(&mut events);
+        assert!(matches!(
+            events[0],
+            SchedulerEvent::TaskPaused { task_id: 0, .. }
+        ));
+        assert!(matches!(
+            events[1],
+            SchedulerEvent::TaskTriggered { task_id: 0, .. }
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::TaskResumed { task_id: 0, .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::RunFinished { .. })));
+    }
+
+    /// A generated task that cannot be added is published as `TaskRejected` instead of
+    /// being dropped silently. (F4)
+    #[tokio::test]
+    async fn test_generator_rejection_is_reported() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler
+            .add_task(
+                TaskBuilder::new(Local)
+                    .every("* * * * * * *")
+                    .name("taken")
+                    .build(),
+            )
+            .unwrap();
+        scheduler.set_task_gen(
+            TaskGenerator::new("* * * * * * *", Local, || {
+                Some(
+                    TaskBuilder::new(Local)
+                        .every("* * * * * * *")
+                        .name("taken")
+                        .build(),
+                )
+            })
+            .unwrap(),
+        );
+        let mut events = scheduler.handle().subscribe();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!scheduler.run_task_gen());
+        let rejected = drain_events(&mut events).into_iter().find_map(|e| match e {
+            SchedulerEvent::TaskRejected { task_name, reason } => Some((task_name, reason)),
+            _ => None,
+        });
+        let (name, reason) = rejected.expect("rejection was published");
+        assert_eq!(name.as_deref(), Some("taken"));
+        assert!(reason.contains("taken"));
+        assert_eq!(scheduler.handles.len(), 1);
+    }
+
+    /// A fire-and-forget spawn that is rejected is published as `TaskRejected`. (F4)
+    #[tokio::test]
+    async fn test_spawn_rejection_is_reported() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let spawner = scheduler.spawner();
+        let mut events = scheduler.handle().subscribe();
+        spawner
+            .spawn(
+                TaskBuilder::new(Local)
+                    .every("* * * * * * *")
+                    .pool("nope")
+                    .build(),
+            )
+            .unwrap();
+        scheduler.drain_spawns();
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRejected { reason, .. } if reason.contains("nope")
+        )));
+    }
+
+    /// Runs start on their scheduled second even when the maximum idle wait is far
+    /// longer than the schedule's interval. (P3)
+    #[tokio::test]
+    async fn test_timer_driven_dispatch_is_on_time() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        // A one-minute idle wait: with polling, nothing would run in this test.
+        let mut scheduler = TaskScheduler::new(60_000, Local);
+        let id = scheduler
+            .add_task_get_id(counting_task(&counter, None))
+            .unwrap();
+        let handle = scheduler.handle();
+        let probe = handle.clone();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            probe.history(id)
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2800)))
+            .await;
+        let history = observer.await.unwrap();
+
+        assert!(
+            history.len() >= 2,
+            "expected 2+ runs, got {}",
+            history.len()
+        );
+        for record in &history {
+            let late_ms = record.started_at.timestamp_subsec_millis();
+            assert!(late_ms < 200, "run started {late_ms} ms after its slot");
+        }
+    }
+
+    /// Under `MissedRunPolicy::Skip`, resuming after a long pause skips the missed slot
+    /// instead of running it late, while the default `RunOnce` runs it once. (P3, F10)
+    #[tokio::test]
+    async fn test_resume_after_pause_follows_missed_run_policy() {
+        async fn runs_after_resume(policy: MissedRunPolicy) -> (usize, Vec<SchedulerEvent>) {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let c = counter.clone();
+            let mut scheduler = TaskScheduler::new(1000, Local);
+            let task = TaskBuilder::new(Local)
+                .every("* * * * * * *")
+                .missed_runs(policy)
+                .add_step_default(move |_ctx| {
+                    let c = c.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(Success)
+                    }
+                })
+                .build();
+            scheduler.add_task(task).unwrap();
+            let handle = scheduler.handle();
+            let mut events = handle.subscribe();
+            handle.pause(0);
+            // Several per-second slots pass while paused.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            scheduler.dispatch_round();
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "paused task must not run"
+            );
+            handle.resume(0);
+            scheduler.dispatch_round();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            (counter.load(Ordering::SeqCst), drain_events(&mut events))
+        }
+
+        let (runs, events) = runs_after_resume(MissedRunPolicy::Skip {
+            grace: Duration::from_millis(500),
+        })
+        .await;
+        assert_eq!(runs, 0, "Skip drops the late slot");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::RunSkipped { task_id: 0, .. })));
+
+        let (runs, events) = runs_after_resume(MissedRunPolicy::RunOnce).await;
+        assert_eq!(runs, 1, "RunOnce runs the late slot once");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::RunSkipped { .. })));
+    }
+
+    /// `OverlapPolicy::Queue` does not queue an extra run when no slot came due during
+    /// the run. Before 0.6.0 any run longer than one poll period got a spurious
+    /// second run. (F13)
+    #[tokio::test]
+    async fn test_queue_without_missed_slot_runs_once() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let task = TaskBuilder::new(Local)
+            // Hourly: no slot can pass during the 1.5 s run below.
+            .every("0 0 * * * * *")
+            .overlap(OverlapPolicy::Queue)
+            .add_step_default(move |_ctx| {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    Ok(Success)
+                }
+            })
+            .build();
+        scheduler.add_task(task).unwrap();
+        // Make the task due now.
+        scheduler.handles[0].shared.state.lock().unwrap().next_exec =
+            Some(Utc::now() - chrono::Duration::milliseconds(10));
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2500)))
+            .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// `OverlapPolicy::Queue` runs a slot that passed during a run right after it, while
+    /// `Skip` waits for the next future slot. (C4)
+    #[tokio::test]
+    async fn test_queue_runs_slot_missed_during_run() {
+        async fn gap_between_runs(policy: OverlapPolicy) -> chrono::Duration {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let mut scheduler = TaskScheduler::new(100, Local);
+            let id = scheduler
+                .add_task_get_id(sleeping_task(1200, &runs).overlap(policy).build())
+                .unwrap();
+            let probe = scheduler.handle();
+            let observer = tokio::spawn(async move {
+                loop {
+                    let history = probe.history(id);
+                    if history.len() >= 2 {
+                        return history;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            scheduler
+                .run_until(async {
+                    let _ = tokio::time::timeout(Duration::from_secs(6), async {
+                        while !observer.is_finished() {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await;
+                })
+                .await;
+            let history = observer.await.unwrap();
+            history[1].started_at - history[0].finished_at.unwrap()
+        }
+
+        let queued = gap_between_runs(OverlapPolicy::Queue).await;
+        assert!(
+            queued < chrono::Duration::milliseconds(300),
+            "Queue should rerun at once, gap was {queued}"
+        );
+        let skipped = gap_between_runs(OverlapPolicy::Skip).await;
+        assert!(
+            skipped > chrono::Duration::milliseconds(400),
+            "Skip should wait for the next slot, gap was {skipped}"
+        );
+    }
+
+    /// `max_concurrent_runs` caps the number of simultaneous runs; runs over the limit
+    /// are reported as waiting. (P5)
+    #[tokio::test]
+    async fn test_max_concurrent_runs() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.max_concurrent_runs(1);
+        for _ in 0..3 {
+            let a = active.clone();
+            let p = peak.clone();
+            scheduler
+                .add_task(
+                    TaskBuilder::new(Local)
+                        .every("* * * * * * *")
+                        .add_step_default(move |_ctx| {
+                            let a = a.clone();
+                            let p = p.clone();
+                            async move {
+                                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                                p.fetch_max(now, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                a.fetch_sub(1, Ordering::SeqCst);
+                                Ok(Success)
+                            }
+                        })
+                        .build(),
+                )
+                .unwrap();
+        }
+        let probe = scheduler.handle();
+        let saw_waiting = Arc::new(AtomicBool::new(false));
+        let w = saw_waiting.clone();
+        let observer = tokio::spawn(async move {
+            for _ in 0..150 {
+                if probe.statuses().iter().any(|s| s.waiting) {
+                    w.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1800)))
+            .await;
+        observer.await.unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert!(saw_waiting.load(Ordering::SeqCst));
+    }
+
+    /// A pool limits only its own tasks, and an unknown pool is rejected. (P5)
+    #[tokio::test]
+    async fn test_pool_limits() {
+        let pool_active = Arc::new(AtomicUsize::new(0));
+        let pool_peak = Arc::new(AtomicUsize::new(0));
+        let free_runs = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        assert!(matches!(
+            scheduler.add_task(TaskBuilder::new(Local).pool("db").build()),
+            Err(TaskError::UnknownPool(name)) if name == "db"
+        ));
+        scheduler.add_pool("db", 1);
+        for _ in 0..2 {
+            let a = pool_active.clone();
+            let p = pool_peak.clone();
+            scheduler
+                .add_task(
+                    TaskBuilder::new(Local)
+                        .every("* * * * * * *")
+                        .pool("db")
+                        .add_step_default(move |_ctx| {
+                            let a = a.clone();
+                            let p = p.clone();
+                            async move {
+                                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                                p.fetch_max(now, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                a.fetch_sub(1, Ordering::SeqCst);
+                                Ok(Success)
+                            }
+                        })
+                        .build(),
+                )
+                .unwrap();
+        }
+        scheduler.add_task(counting_task(&free_runs, None)).unwrap();
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1500)))
+            .await;
+        assert_eq!(pool_peak.load(Ordering::SeqCst), 1);
+        assert!(free_runs.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Stopping a task while it waits for a permit abandons the run before it starts. (P1, P5)
+    #[tokio::test]
+    async fn test_stop_while_waiting_for_permit() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.max_concurrent_runs(1);
+        scheduler.grace_period(Duration::from_millis(200));
+        let blocker = scheduler
+            .add_task_get_id(sleeping_task(30_000, &runs).build())
+            .unwrap();
+        let waiter_runs = Arc::new(AtomicUsize::new(0));
+        let waiter = scheduler
+            .add_task_get_id(counting_task(&waiter_runs, None))
+            .unwrap();
+        let probe = scheduler.handle();
+        tokio::spawn(async move {
+            while !probe.state_of(waiter).is_some_and(|s| s.waiting) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.remove(waiter);
+            let _ = blocker;
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1800)))
+            .await;
+        assert_eq!(waiter_runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Events and reports round-trip through serde. (P2, `serde` feature)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_events() {
+        use crate::task::{FinishReport, RunReport};
+        let record = RunRecord {
+            run_id: 1,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            outcome: Some(RunOutcome::Cancelled),
+            attempts: 1,
+            error: Some("stopped".to_string()),
+            failed_step: None,
+        };
+        let events = vec![
+            SchedulerEvent::RunFinished {
+                report: RunReport {
+                    task_id: 3,
+                    task_name: Some("t".to_string()),
+                    record: record.clone(),
+                    steps: Vec::new(),
+                },
+            },
+            SchedulerEvent::TaskRemoved {
+                task_id: 3,
+                task_name: None,
+                reason: FinishReason::Shutdown,
+            },
+            SchedulerEvent::TaskRejected {
+                task_name: None,
+                reason: "duplicate".to_string(),
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<SchedulerEvent>(&json).unwrap(),
+                event
+            );
+        }
+        let finish = FinishReport {
+            task_id: 3,
+            task_name: None,
+            reason: FinishReason::Removed,
+            last_run: Some(record),
+        };
+        let json = serde_json::to_string(&finish).unwrap();
+        assert_eq!(serde_json::from_str::<FinishReport>(&json).unwrap(), finish);
+    }
+
+    /// A generator whose schedule has no further execution is dropped instead of being
+    /// treated as due on every loop iteration. (review #1)
+    #[tokio::test]
+    async fn test_exhausted_generator_is_dropped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        // A single slot, one second from now.
+        let slot = Local::now() + chrono::Duration::seconds(1);
+        let expression = slot.format("%S %M %H %d %m * %Y").to_string();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler.set_task_gen(
+            TaskGenerator::new(&expression, Local, move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+            .unwrap(),
+        );
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2500)))
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the single slot ran once");
+        assert!(
+            scheduler.task_gen.is_none(),
+            "the exhausted generator was dropped"
+        );
+    }
+
+    /// A trigger that lands while a run is finishing is never lost. Stress test on a
+    /// multi-thread runtime. (review #2, #9)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_trigger_during_run_completion_is_not_lost() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        let task = TaskBuilder::new(Local)
+            // Far in the future: every run below comes from a trigger.
+            .every("0 0 0 1 1 * 2099")
+            .add_step_default(move |_ctx| {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(Success)
+                }
+            })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let handle = scheduler.handle();
+        let driver = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+        for iteration in 0..300 {
+            let before = runs.load(Ordering::SeqCst);
+            assert!(handle.trigger(id));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while runs.load(Ordering::SeqCst) <= before {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "trigger {iteration} was lost"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+        handle.shutdown();
+        driver.await.unwrap();
+    }
+
+    /// A driver that stops without finishing is detected, its run closed as cancelled
+    /// and its removal reported. (review #3)
+    #[tokio::test]
+    async fn test_crashed_driver_is_reaped() {
+        let mut scheduler = TaskScheduler::new(1000, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        // Replace the real driver with one that has already stopped, as a panic would.
+        let shared = scheduler.handles[0].shared.clone();
+        shared.start_run_for_test();
+        scheduler.handles[0].join.take().unwrap().abort();
+        let stopped = tokio::spawn(async {});
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        scheduler.handles[0].join = Some(stopped);
+        scheduler.dispatch_round();
+
+        assert_eq!(handle.task_count(), 0);
+        assert_eq!(
+            shared.history.lock().unwrap()[0].outcome,
+            Some(RunOutcome::Cancelled)
+        );
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRemoved {
+                reason: FinishReason::Panicked,
+                ..
+            }
+        )));
+    }
+
+    /// A panicking step fails its run with the panic message and the task keeps
+    /// running; a panicking callback is ignored. (review #3)
+    #[tokio::test]
+    async fn test_panicking_step_and_callback_do_not_kill_the_task() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .add_step("explode", move |_ctx| {
+                let c = c.clone();
+                async move {
+                    if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom");
+                    }
+                    Ok(Success)
+                }
+            })
+            .on_failure(|_| async { panic!("callback boom") })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let probe = scheduler.handle();
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            probe.history(id)
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(2800)))
+            .await;
+        let history = observer.await.unwrap();
+        assert!(history.len() >= 2, "the task kept running after the panic");
+        assert_eq!(history[0].outcome, Some(RunOutcome::Failed));
+        assert_eq!(history[0].error.as_deref(), Some("step panicked: boom"));
+        assert_eq!(history[1].outcome, Some(RunOutcome::Success));
+    }
+
+    /// A spawner used after the scheduler stopped gets an error instead of hanging.
+    /// (review #4)
+    #[tokio::test]
+    async fn test_spawn_after_shutdown_fails() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let spawner = scheduler.spawner();
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(50)))
+            .await;
+        assert!(matches!(
+            spawner.spawn(TaskBuilder::new(Local).build()),
+            Err(TaskError::ExecutionError(_))
+        ));
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            spawner.spawn_get_id(TaskBuilder::new(Local).build()),
+        )
+        .await
+        .expect("spawn_get_id must not hang after shutdown");
+        assert!(matches!(result, Err(TaskError::ExecutionError(_))));
+    }
+
+    /// Removing a task during its last repeat reports `Removed`, not `Completed`.
+    /// (review #5)
+    #[tokio::test]
+    async fn test_remove_during_last_repeat_reports_removed() {
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let r = reasons.clone();
+        let mut scheduler = TaskScheduler::new(100, Local);
+        let task = TaskBuilder::new(Local)
+            .every("* * * * * * *")
+            .repeat(1)
+            .add_step("wait", |ctx| async move {
+                ctx.cancelled().await;
+                Err(TaskStepStatusErr::error("stopped"))
+            })
+            .on_finish(move |report| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push(report.reason) }
+            })
+            .build();
+        let id = scheduler.add_task_get_id(task).unwrap();
+        let handle = scheduler.handle();
+        let mut events = handle.subscribe();
+        let probe = handle.clone();
+        tokio::spawn(async move {
+            while !probe.state_of(id).is_some_and(|s| s.running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            probe.remove(id);
+        });
+        scheduler
+            .run_until(tokio::time::sleep(Duration::from_millis(1800)))
+            .await;
+        assert_eq!(*reasons.lock().unwrap(), vec![FinishReason::Removed]);
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRemoved {
+                reason: FinishReason::Removed,
+                ..
+            }
+        )));
+    }
+
+    /// A task added outside a runtime computes its first execution time again when the
+    /// scheduler starts, so a slot that passed in between is not run late. (review #12)
+    #[test]
+    fn test_unstarted_task_reinitializes_on_start() {
+        let mut scheduler = TaskScheduler::new(100, Local);
+        scheduler
+            .add_task(Task::new("* * * * * * *", None, None, Local))
+            .unwrap();
+        let handle = scheduler.handle();
+        let stale = handle.state_of(0).unwrap().next_exec.unwrap();
+        std::thread::sleep(Duration::from_millis(2200));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let probe = handle.clone();
+        let fresh = runtime.block_on(async move {
+            let observer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                probe.state_of(0).unwrap().next_exec.unwrap()
+            });
+            scheduler
+                .run_until(tokio::time::sleep(Duration::from_millis(60)))
+                .await;
+            observer.await.unwrap()
+        });
+        assert!(fresh > stale + chrono::Duration::seconds(1));
     }
 }

@@ -2,23 +2,34 @@ extern crate chrono;
 extern crate cron;
 
 use crate::blackboard::Blackboard;
+use crate::cancel::CancelToken;
 use crate::errors::{TaskError, TaskResult};
+use crate::events::{SchedulerEvent, EVENT_CAPACITY};
+use crate::limits::Limiter;
 use crate::retry::RetryPolicy;
 use crate::{step_log, task_log};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Notify};
 
 /// The default number of past [`RunRecord`]s kept per task.
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 20;
+
+/// The smallest grace period [`MissedRunPolicy::Skip`] applies. Every dispatch starts a
+/// little after its slot, and cron has one-second resolution, so a shorter grace
+/// would skip on-time runs.
+pub(crate) const MIN_MISSED_RUN_GRACE: Duration = Duration::from_secs(1);
 
 /// Possible success status values for a step's execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,12 +41,61 @@ pub enum TaskStepStatusOk {
 }
 
 /// Possible error status values for a step's execution.
+///
+/// Both variants carry a human-readable reason. It is stored in the step's
+/// [`StepState::error`] and the run's [`RunRecord::error`], and reaches the
+/// [`on_failure`](crate::TaskBuilder::on_failure) callback through its [`RunReport`].
+///
+/// # Examples
+///
+/// ```
+/// use tasklet::task::TaskStepStatusErr;
+///
+/// let retryable = TaskStepStatusErr::error("database unavailable");
+/// assert_eq!(retryable.reason(), "database unavailable");
+/// assert!(!retryable.is_fatal());
+///
+/// let fatal = TaskStepStatusErr::error_delete("configuration removed");
+/// assert!(fatal.is_fatal());
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskStepStatusErr {
-    /// The task step execution failed.
-    Error,
-    /// The step failed and the task has to be removed from the execution list.
-    ErrorDelete,
+    /// The step failed. It is retried under the task's [`RetryPolicy`], if any; after
+    /// the last attempt the run fails and the task stays scheduled.
+    Error(String),
+    /// The step failed and the task has to be removed from the scheduler. Retries are
+    /// skipped.
+    ErrorDelete(String),
+}
+
+impl TaskStepStatusErr {
+    /// A retryable failure with the given reason.
+    pub fn error(reason: impl Into<String>) -> Self {
+        TaskStepStatusErr::Error(reason.into())
+    }
+
+    /// A fatal failure with the given reason; the task is removed.
+    pub fn error_delete(reason: impl Into<String>) -> Self {
+        TaskStepStatusErr::ErrorDelete(reason.into())
+    }
+
+    /// The failure's reason.
+    pub fn reason(&self) -> &str {
+        match self {
+            TaskStepStatusErr::Error(reason) | TaskStepStatusErr::ErrorDelete(reason) => reason,
+        }
+    }
+
+    /// Whether the failure removes the task ([`ErrorDelete`](Self::ErrorDelete)).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, TaskStepStatusErr::ErrorDelete(_))
+    }
+}
+
+impl fmt::Display for TaskStepStatusErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
 }
 
 /// The boxed future produced by a task step when it is invoked.
@@ -53,8 +113,9 @@ pub type ExecutableFn = dyn FnMut(TaskContext) -> StepFuture + 'static + Send;
 
 /// The execution context handed to a step each time it runs.
 ///
-/// A `TaskContext` identifies the run (which task, which run, which step, which attempt)
-/// and gives the step access to two typed key/value stores:
+/// A `TaskContext` identifies the run (which task, which run, which step, which attempt),
+/// tells the step whether it should stop early, and gives it access to two typed
+/// key/value stores:
 ///
 /// * [`blackboard`](TaskContext::blackboard) - the task-level [`Blackboard`], shared
 ///   across every run of the task and, if the same blackboard is attached to several
@@ -95,6 +156,7 @@ pub struct TaskContext {
     attempt: u32,
     blackboard: Blackboard,
     run_store: Blackboard,
+    cancel: CancelToken,
 }
 
 impl TaskContext {
@@ -137,6 +199,43 @@ impl TaskContext {
     pub fn run_store(&self) -> &Blackboard {
         &self.run_store
     }
+
+    /// Whether the task is being stopped, because it was removed through
+    /// [`SchedulerHandle::remove`](crate::SchedulerHandle::remove) or the scheduler is
+    /// shutting down.
+    ///
+    /// A long-running step should check this (or await [`cancelled`](Self::cancelled))
+    /// and return early. The scheduler waits for the step up to its
+    /// [grace period](crate::TaskScheduler::grace_period) and aborts it after that.
+    /// Remaining steps of a cancelled run do not start.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Resolve once the task is being stopped. Use it in `tokio::select!` to interrupt
+    /// a long wait.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use tasklet::task::TaskStepStatusErr;
+    /// use tasklet::task::TaskStepStatusOk::Success;
+    /// use tasklet::TaskBuilder;
+    ///
+    /// let _task = TaskBuilder::new(chrono::Utc)
+    ///     .every_minutes(5)
+    ///     .add_step("long poll", |ctx| async move {
+    ///         tokio::select! {
+    ///             _ = tokio::time::sleep(Duration::from_secs(60)) => Ok(Success),
+    ///             _ = ctx.cancelled() => Err(TaskStepStatusErr::error("stopped")),
+    ///         }
+    ///     })
+    ///     .build();
+    /// ```
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await
+    }
 }
 
 impl fmt::Debug for TaskContext {
@@ -147,6 +246,7 @@ impl fmt::Debug for TaskContext {
             .field("run_id", &self.run_id)
             .field("step_index", &self.step_index)
             .field("attempt", &self.attempt)
+            .field("cancelled", &self.cancel.is_cancelled())
             .finish_non_exhaustive()
     }
 }
@@ -154,18 +254,75 @@ impl fmt::Debug for TaskContext {
 /// The boxed future produced by a lifecycle callback when it is invoked.
 pub type CallbackFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// An asynchronous lifecycle callback (on-success / on-failure / on-finish).
+/// An asynchronous lifecycle callback taking an argument of type `A`.
 ///
-/// Each call produces a fresh [`CallbackFuture`] to be awaited by the scheduler.
-pub type CallbackFn = dyn FnMut() -> CallbackFuture + 'static + Send;
+/// [`on_success`](crate::TaskBuilder::on_success) and
+/// [`on_failure`](crate::TaskBuilder::on_failure) callbacks receive a [`RunReport`];
+/// [`on_finish`](crate::TaskBuilder::on_finish) callbacks receive a [`FinishReport`].
+pub type CallbackFn<A> = dyn FnMut(A) -> CallbackFuture + 'static + Send;
 
 /// Box an async closure into a [`CallbackFn`].
-pub(crate) fn boxed_callback<F, Fut>(mut callback: F) -> Box<CallbackFn>
+pub(crate) fn boxed_callback<A, F, Fut>(mut callback: F) -> Box<CallbackFn<A>>
 where
-    F: (FnMut() -> Fut) + 'static + Send,
+    F: (FnMut(A) -> Fut) + 'static + Send,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    Box::new(move || Box::pin(callback()))
+    Box::new(move |arg| Box::pin(callback(arg)))
+}
+
+/// Polls a future and turns a panic during any poll into an `Err` carrying the panic
+/// payload, so one panicking step cannot kill the task's driver.
+struct CatchUnwind<F>(F);
+
+impl<F> Future for CatchUnwind<F>
+where
+    F: Future + Unpin,
+{
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.0;
+        match catch_unwind(AssertUnwindSafe(|| Pin::new(&mut *inner).poll(cx))) {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// The message of a panic payload, for logs and error reasons.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// Invoke a step and await it, converting a panic (while creating or polling the
+/// future) into a retryable [`TaskStepStatusErr::Error`].
+async fn call_step(
+    function: &mut Box<ExecutableFn>,
+    ctx: TaskContext,
+) -> Result<TaskStepStatusOk, TaskStepStatusErr> {
+    let future = match catch_unwind(AssertUnwindSafe(|| function(ctx))) {
+        Ok(future) => future,
+        Err(payload) => {
+            return Err(TaskStepStatusErr::Error(format!(
+                "step panicked: {}",
+                panic_message(payload.as_ref())
+            )))
+        }
+    };
+    match CatchUnwind(future).await {
+        Ok(result) => result,
+        Err(payload) => Err(TaskStepStatusErr::Error(format!(
+            "step panicked: {}",
+            panic_message(payload.as_ref())
+        ))),
+    }
 }
 
 /// A task step.
@@ -258,14 +415,18 @@ pub enum Status {
 
 /// The observable status of a single step within a task run.
 ///
-/// Reflects the most recently completed run: before the first run every step is
+/// While a run is in progress the step states are updated live; between runs they hold
+/// the final state of the most recent run. Before the first run every step is
 /// [`StepStatus::Pending`].
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum StepStatus {
-    /// The step has not run yet in the current cycle.
+    /// The step has not started yet in the current run.
     #[default]
     Pending,
+    /// An attempt of the step is executing right now.
+    Running,
     /// The step completed successfully.
     Succeeded,
     /// The step completed but reported non-fatal errors.
@@ -274,23 +435,31 @@ pub enum StepStatus {
     Failed,
     /// The step did not run because an earlier step failed.
     Skipped,
+    /// The step did not run, or was not retried, because the task was being stopped.
+    Cancelled,
 }
 
-/// A read-only view of a single step's identity and last-run outcome.
+/// A read-only view of a single step's identity and state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct StepState {
     /// The step's zero-based position within the task.
     pub index: usize,
     /// The step's optional description.
     pub description: Option<String>,
-    /// The step's status as of the last completed run.
+    /// The step's status in the current run, or in the most recent run when idle.
     pub status: StepStatus,
+    /// The number of attempts made in that run (0 if the step has not started).
+    pub attempts: u32,
+    /// The reason of the step's most recent failed attempt in that run, if any.
+    pub error: Option<String>,
 }
 
 /// The outcome of a single task run, recorded in the task's [`RunRecord`] history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum RunOutcome {
     /// Every step succeeded.
     Success,
@@ -300,11 +469,14 @@ pub enum RunOutcome {
     Failed,
     /// A step requested force-removal of the task.
     ForceRemoved,
+    /// The run was interrupted because the task was removed or the scheduler shut down.
+    Cancelled,
 }
 
 /// A record of one execution of a task, kept in a bounded per-task history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct RunRecord {
     /// A per-task monotonically increasing run identifier.
     pub run_id: usize,
@@ -316,6 +488,76 @@ pub struct RunRecord {
     pub outcome: Option<RunOutcome>,
     /// The total number of step attempts made during the run (including retries).
     pub attempts: usize,
+    /// The reason of the failure that ended the run, if a step failed.
+    pub error: Option<String>,
+    /// The index of the step that failed, if any.
+    pub failed_step: Option<usize>,
+}
+
+impl RunRecord {
+    /// A record for a run that has just started.
+    pub(crate) fn started(run_id: usize, started_at: DateTime<Utc>) -> Self {
+        RunRecord {
+            run_id,
+            started_at,
+            finished_at: None,
+            outcome: None,
+            attempts: 0,
+            error: None,
+            failed_step: None,
+        }
+    }
+}
+
+/// The result of one run, handed to the [`on_success`](crate::TaskBuilder::on_success)
+/// and [`on_failure`](crate::TaskBuilder::on_failure) callbacks and published in
+/// [`SchedulerEvent::RunFinished`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct RunReport {
+    /// The task's id.
+    pub task_id: usize,
+    /// The task's name, if set.
+    pub task_name: Option<String>,
+    /// The completed run.
+    pub record: RunRecord,
+    /// Every step's final state in the run.
+    pub steps: Vec<StepState>,
+}
+
+/// Why a task left the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum FinishReason {
+    /// The task completed its repeat count, or its schedule has no further execution.
+    Completed,
+    /// A step returned [`TaskStepStatusErr::ErrorDelete`].
+    ForceRemoved,
+    /// The task was removed through [`SchedulerHandle::remove`](crate::SchedulerHandle::remove).
+    Removed,
+    /// The scheduler shut down.
+    Shutdown,
+    /// The task's driver stopped unexpectedly. Panics in steps and callbacks are caught,
+    /// so this indicates a bug in tasklet itself.
+    Panicked,
+}
+
+/// Handed to the [`on_finish`](crate::TaskBuilder::on_finish) callback when a task
+/// leaves the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct FinishReport {
+    /// The task's id.
+    pub task_id: usize,
+    /// The task's name, if set.
+    pub task_name: Option<String>,
+    /// Why the task left.
+    pub reason: FinishReason,
+    /// The task's most recent run, if it ran at all.
+    pub last_run: Option<RunRecord>,
 }
 
 /// What to do when a task's next scheduled time arrives while a previous run of
@@ -334,26 +576,106 @@ pub enum OverlapPolicy {
     Queue,
 }
 
+/// What to do with a scheduled run that starts late: because the task was paused when
+/// it came due, or because the process was busy or suspended.
+///
+/// Runs requested with [`SchedulerHandle::trigger`](crate::SchedulerHandle::trigger)
+/// and runs queued by [`OverlapPolicy::Queue`] are never skipped.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use tasklet::{MissedRunPolicy, TaskBuilder};
+///
+/// // Drop any run that would start more than 30 seconds after its slot.
+/// let _task = TaskBuilder::new(chrono::Utc)
+///     .every_minutes(5)
+///     .missed_runs(MissedRunPolicy::Skip { grace: Duration::from_secs(30) })
+///     .build();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MissedRunPolicy {
+    /// Run once as soon as possible, however late, then continue with the next future
+    /// slot. Several missed slots still produce a single run. This is the default.
+    #[default]
+    RunOnce,
+    /// Skip the run if it would start more than `grace` after its scheduled time, and
+    /// continue with the next future slot. The check is made when the run is dispatched
+    /// and again after it waits for a concurrency permit. A grace below one second is
+    /// treated as one second.
+    Skip {
+        /// How late a run may start and still execute.
+        grace: Duration,
+    },
+}
+
+/// Who asked for a run; decides whether the [`MissedRunPolicy`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunKind {
+    /// Dispatched by the scheduler because the task's slot came due.
+    Scheduled,
+    /// Requested through the handle.
+    Triggered,
+    /// Queued while a previous run was in progress.
+    Queued,
+}
+
 /// A command sent from the scheduler to a running task.
 #[derive(Debug)]
 pub(crate) enum TaskCmd {
     /// Execute the task once now.
-    Run,
+    Run(RunKind),
+}
+
+/// The scheduler-side resources a task is wired to when it is added.
+#[derive(Debug, Clone)]
+pub(crate) struct SchedulerLinks {
+    /// Where the task publishes [`SchedulerEvent`]s.
+    pub(crate) events: broadcast::Sender<SchedulerEvent>,
+    /// Notified whenever the scheduler should recompute its next wake-up.
+    pub(crate) wake: Arc<Notify>,
+    /// The scheduler's concurrency limits.
+    pub(crate) limiter: Arc<Limiter>,
+}
+
+impl Default for SchedulerLinks {
+    fn default() -> Self {
+        SchedulerLinks {
+            events: broadcast::channel(EVENT_CAPACITY).0,
+            wake: Arc::new(Notify::new()),
+            limiter: Arc::new(Limiter::default()),
+        }
+    }
 }
 
 /// State a running task publishes so the scheduler can observe it and decide when
 /// to dispatch the next run without a blocking request/response round-trip.
 #[derive(Debug)]
 pub(crate) struct TaskShared {
+    /// The task's id.
+    pub(crate) id: usize,
+    /// The task's name, if set.
+    pub(crate) name: Option<String>,
+    /// The concurrency pool the task belongs to, if any.
+    pub(crate) pool: Option<String>,
     /// True while a run is in progress.
     pub(crate) running: AtomicBool,
-    /// Set when a due occurrence was missed while running (used by [`OverlapPolicy::Queue`]).
+    /// True while a run is waiting for a concurrency permit.
+    pub(crate) waiting: AtomicBool,
+    /// True from the moment a `Run` is sent until the task is idle again. Whoever flips
+    /// it from false to true owns the dispatch, so two senders cannot queue duplicate
+    /// runs.
+    pub(crate) dispatched: AtomicBool,
+    /// Set when another run was requested while one was in progress (a trigger, or a
+    /// slot that came due under [`OverlapPolicy::Queue`]).
     pub(crate) pending: AtomicBool,
-    /// Set once the task reaches a terminal state so the scheduler reaps it.
+    /// Set once the task's driver has exited, so the scheduler reaps it.
     pub(crate) finished: AtomicBool,
     /// Set while the task is paused; a paused task is not dispatched.
     pub(crate) paused: AtomicBool,
-    /// Set when a caller has requested removal; the scheduler reaps the task next round.
+    /// Set when a caller has requested removal.
     pub(crate) remove_requested: AtomicBool,
     /// Total number of runs started over the task's lifetime.
     pub(crate) runs: AtomicUsize,
@@ -363,10 +685,20 @@ pub(crate) struct TaskShared {
     history_limit: usize,
     /// The observable lifecycle state (status + next execution time, in UTC).
     pub(crate) state: Mutex<SharedState>,
-    /// The per-step state as of the last completed run.
+    /// The per-step state, updated live during a run.
     pub(crate) steps: Mutex<Vec<StepState>>,
     /// A bounded history of recent runs, oldest first.
     pub(crate) history: Mutex<VecDeque<RunRecord>>,
+    /// The outcome of the most recent finished run, kept even when history is disabled.
+    pub(crate) last_outcome: Mutex<Option<RunOutcome>>,
+    /// Why the task is being stopped, set by removal or shutdown before cancelling.
+    pub(crate) stop_reason: Mutex<Option<FinishReason>>,
+    /// Guards the single [`SchedulerEvent::TaskRemoved`] per task.
+    removal_reported: AtomicBool,
+    /// Cancelled when the task is being stopped.
+    pub(crate) cancel: CancelToken,
+    /// Links back to the owning scheduler.
+    pub(crate) links: SchedulerLinks,
 }
 
 /// The observable, timezone-erased portion of a task's state.
@@ -379,25 +711,68 @@ pub(crate) struct SharedState {
 }
 
 impl TaskShared {
-    /// Create a fresh shared-state cell for an uninitialized task.
-    ///
-    /// `history_limit` bounds how many [`RunRecord`]s are retained.
-    pub(crate) fn new(history_limit: usize) -> Self {
+    /// Create the shared cell for a task that is about to be added to a scheduler.
+    pub(crate) fn new<T>(task: &Task<T>, links: SchedulerLinks) -> Self
+    where
+        T: TimeZone + Send + 'static,
+    {
         TaskShared {
+            id: task.task_id,
+            name: task.name.clone(),
+            pool: task.pool.clone(),
             running: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            dispatched: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             remove_requested: AtomicBool::new(false),
             runs: AtomicUsize::new(0),
             run_seq: AtomicUsize::new(0),
-            history_limit,
+            history_limit: task.history_limit,
             state: Mutex::new(SharedState {
-                status: Status::Init,
-                next_exec: None,
+                status: task.status.clone(),
+                next_exec: task.next_exec_utc(),
             }),
-            steps: Mutex::new(Vec::new()),
+            steps: Mutex::new(task.step_states.clone()),
             history: Mutex::new(VecDeque::new()),
+            last_outcome: Mutex::new(None),
+            stop_reason: Mutex::new(None),
+            removal_reported: AtomicBool::new(false),
+            cancel: task.cancel.clone(),
+            links,
+        }
+    }
+
+    /// Publish an event to the scheduler's subscribers. A send with no subscriber is
+    /// not an error.
+    pub(crate) fn emit(&self, event: SchedulerEvent) {
+        let _ = self.links.events.send(event);
+    }
+
+    /// Ask the task to stop for `reason`. The first reason recorded wins.
+    pub(crate) fn request_stop(&self, reason: FinishReason) {
+        self.stop_reason.lock().unwrap().get_or_insert(reason);
+        self.cancel.cancel();
+    }
+
+    /// The reason recorded by [`request_stop`](Self::request_stop), or `Shutdown`.
+    pub(crate) fn stop_reason(&self) -> FinishReason {
+        self.stop_reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(FinishReason::Shutdown)
+    }
+
+    /// Publish [`SchedulerEvent::TaskRemoved`] unless it was already published.
+    pub(crate) fn report_removed(&self, reason: FinishReason) {
+        if !self.removal_reported.swap(true, Ordering::SeqCst) {
+            self.emit(SchedulerEvent::TaskRemoved {
+                task_id: self.id,
+                task_name: self.name.clone(),
+                reason,
+            });
         }
     }
 
@@ -412,31 +787,41 @@ impl TaskShared {
         }
         // A `history_limit` of zero disables history entirely.
         if self.history_limit > 0 {
-            history.push_back(RunRecord {
-                run_id,
-                started_at,
-                finished_at: None,
-                outcome: None,
-                attempts: 0,
-            });
+            history.push_back(RunRecord::started(run_id, started_at));
         }
         run_id
     }
 
-    /// Record the completion of the run with the given id.
-    fn finish_run(
-        &self,
-        run_id: usize,
-        finished_at: DateTime<Utc>,
-        outcome: RunOutcome,
-        attempts: usize,
-    ) {
+    /// Open a run record as a real run would, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn start_run_for_test(&self) -> usize {
+        self.start_run(Utc::now())
+    }
+
+    /// Replace the in-progress record of a run with its final version.
+    fn finish_run(&self, record: &RunRecord) {
         let mut history = self.history.lock().unwrap();
-        if let Some(record) = history.iter_mut().rev().find(|r| r.run_id == run_id) {
-            record.finished_at = Some(finished_at);
-            record.outcome = Some(outcome);
-            record.attempts = attempts;
+        if let Some(entry) = history.iter_mut().rev().find(|r| r.run_id == record.run_id) {
+            *entry = record.clone();
         }
+        *self.last_outcome.lock().unwrap() = record.outcome.clone();
+    }
+
+    /// Mark a run that will never finish (its driver was aborted) as cancelled.
+    pub(crate) fn abandon_run(&self, now: DateTime<Utc>) {
+        let mut abandoned = false;
+        for record in self.history.lock().unwrap().iter_mut() {
+            if record.outcome.is_none() {
+                record.finished_at = Some(now);
+                record.outcome = Some(RunOutcome::Cancelled);
+                abandoned = true;
+            }
+        }
+        if abandoned || self.running.load(Ordering::SeqCst) {
+            *self.last_outcome.lock().unwrap() = Some(RunOutcome::Cancelled);
+        }
+        self.running.store(false, Ordering::SeqCst);
+        self.waiting.store(false, Ordering::SeqCst);
     }
 }
 
@@ -459,15 +844,16 @@ where
     pub(crate) timezone: T,
     /// (Internal) task id.
     pub(crate) task_id: usize,
-    /// (Internal) per-step state of the last run, republished after every run.
+    /// (Internal) per-step state, updated live during a run.
     pub(crate) step_states: Vec<StepState>,
-    /// (Internal) shared cell to publish step-state transitions to as they happen, so
-    /// observers see live progress within a run rather than only the final snapshot.
+    /// (Internal) shared cell to publish step transitions and events to as they happen.
     /// Set by the scheduler when the task is spawned; `None` when the task is driven
-    /// directly (e.g. in unit tests), in which case streaming is a no-op.
-    pub(crate) step_sink: Option<Arc<TaskShared>>,
-    /// (Internal) total step attempts made during the last run.
-    pub(crate) last_attempts: usize,
+    /// directly (e.g. in unit tests), in which case publishing is a no-op.
+    pub(crate) sink: Option<Arc<TaskShared>>,
+    /// (Internal) the record of the most recent completed run.
+    pub(crate) last_run: Option<RunRecord>,
+    /// (Internal) whether the most recent run was interrupted by cancellation.
+    run_cancelled: bool,
     /// The maximum number of run records retained for this task.
     pub(crate) history_limit: usize,
     /// (Internal) next execution time.
@@ -482,13 +868,19 @@ where
     /// (Optional) retry policy applied to failing steps.
     pub(crate) retry_policy: Option<RetryPolicy>,
     /// (Optional) callback invoked after a successful execution.
-    pub(crate) on_success: Option<Box<CallbackFn>>,
+    pub(crate) on_success: Option<Box<CallbackFn<RunReport>>>,
     /// (Optional) callback invoked after a failed execution.
-    pub(crate) on_failure: Option<Box<CallbackFn>>,
-    /// (Optional) callback invoked once when the task reaches a terminal state.
-    pub(crate) on_finish: Option<Box<CallbackFn>>,
+    pub(crate) on_failure: Option<Box<CallbackFn<RunReport>>>,
+    /// (Optional) callback invoked once when the task leaves the scheduler.
+    pub(crate) on_finish: Option<Box<CallbackFn<FinishReport>>>,
     /// Behaviour when a scheduled run overlaps a still-running one.
     pub(crate) overlap: OverlapPolicy,
+    /// Behaviour when a scheduled run starts late.
+    pub(crate) missed_runs: MissedRunPolicy,
+    /// The concurrency pool the task belongs to, if any.
+    pub(crate) pool: Option<String>,
+    /// Cancelled when the task is being stopped; handed to every step's context.
+    pub(crate) cancel: CancelToken,
     /// The task-level shared store handed to every step through its [`TaskContext`].
     /// Defaults to a fresh, empty [`Blackboard`]; attach a shared one via
     /// [`TaskBuilder::blackboard`](crate::TaskBuilder::blackboard) to pass data across
@@ -503,12 +895,16 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Task")
             .field("task_id", &self.task_id)
+            .field("name", &self.name)
             .field("description", &self.description)
             .field("status", &self.status)
             .field("repeats", &self.repeats)
             .field("next_exec", &self.next_exec)
             .field("timeout", &self.timeout)
             .field("retry_policy", &self.retry_policy)
+            .field("overlap", &self.overlap)
+            .field("missed_runs", &self.missed_runs)
+            .field("pool", &self.pool)
             .finish()
     }
 }
@@ -561,8 +957,9 @@ where
             timezone,
             task_id: 0,
             step_states: Vec::new(),
-            step_sink: None,
-            last_attempts: 0,
+            sink: None,
+            last_run: None,
+            run_cancelled: false,
             history_limit: DEFAULT_HISTORY_LIMIT,
             status: Status::default(),
             next_exec: None,
@@ -573,6 +970,9 @@ where
             on_failure: None,
             on_finish: None,
             overlap: OverlapPolicy::default(),
+            missed_runs: MissedRunPolicy::default(),
+            pool: None,
+            cancel: CancelToken::new(),
             blackboard: Blackboard::new(),
         })
     }
@@ -583,6 +983,9 @@ where
     }
 
     /// Set the task id of the current task.
+    ///
+    /// The scheduler assigns ids itself when a task is added, overwriting any value set
+    /// here.
     ///
     /// # Arguments
     ///
@@ -670,6 +1073,18 @@ where
         self
     }
 
+    /// Set the missed-run policy.
+    pub(crate) fn set_missed_runs(&mut self, policy: MissedRunPolicy) -> &mut Task<T> {
+        self.missed_runs = policy;
+        self
+    }
+
+    /// Put the task in a named concurrency pool.
+    pub(crate) fn set_pool(&mut self, pool: &str) -> &mut Task<T> {
+        self.pool = Some(pool.to_string());
+        self
+    }
+
     /// Set the task's unique name.
     pub(crate) fn set_name(&mut self, name: &str) -> &mut Task<T> {
         self.name = Some(name.to_string());
@@ -700,6 +1115,8 @@ where
                 index,
                 description: step.description.clone(),
                 status: StepStatus::Pending,
+                attempts: 0,
+                error: None,
             })
             .collect();
     }
@@ -707,17 +1124,24 @@ where
     /// Publish the current per-step snapshot to the shared cell, if a sink is set, so
     /// observers see step transitions live during a run. A no-op when no sink is set.
     fn publish_steps(&self) {
-        if let Some(shared) = &self.step_sink {
+        if let Some(shared) = &self.sink {
             *shared.steps.lock().unwrap() = self.step_states.clone();
+        }
+    }
+
+    /// Publish an event through the sink, if one is set.
+    fn emit(&self, event: SchedulerEvent) {
+        if let Some(shared) = &self.sink {
+            shared.emit(event);
         }
     }
 
     /// Set the callbacks invoked over the task's lifecycle.
     pub(crate) fn set_callbacks(
         &mut self,
-        on_success: Option<Box<CallbackFn>>,
-        on_failure: Option<Box<CallbackFn>>,
-        on_finish: Option<Box<CallbackFn>>,
+        on_success: Option<Box<CallbackFn<RunReport>>>,
+        on_failure: Option<Box<CallbackFn<RunReport>>>,
+        on_finish: Option<Box<CallbackFn<FinishReport>>>,
     ) -> &mut Task<T> {
         self.on_success = on_success;
         self.on_failure = on_failure;
@@ -726,17 +1150,38 @@ where
     }
 
     /// Invoke a lifecycle callback if it is set.
-    async fn fire_callback(callback: &mut Option<Box<CallbackFn>>) {
+    ///
+    /// A panicking callback is logged and otherwise ignored, so it cannot stop the
+    /// task's driver.
+    async fn fire_callback<A>(task_id: usize, callback: &mut Option<Box<CallbackFn<A>>>, arg: A) {
         if let Some(callback) = callback.as_mut() {
-            callback().await;
+            let outcome = match catch_unwind(AssertUnwindSafe(|| callback(arg))) {
+                Ok(future) => CatchUnwind(future).await,
+                Err(payload) => Err(payload),
+            };
+            if let Err(payload) = outcome {
+                task_log!(
+                    task_id,
+                    log::Level::Error,
+                    "Lifecycle callback panicked: {}",
+                    panic_message(payload.as_ref())
+                );
+            }
         }
     }
 
+    /// Fire `on_finish` with the given reason.
+    pub(crate) async fn fire_finish(&mut self, reason: FinishReason) {
+        let report = FinishReport {
+            task_id: self.task_id,
+            task_name: self.name.clone(),
+            reason,
+            last_run: self.last_run.clone(),
+        };
+        Self::fire_callback(self.task_id, &mut self.on_finish, report).await;
+    }
+
     /// Initialize the `Task` instance and schedule the first execution.
-    ///
-    /// # Arguments
-    ///
-    /// * id - The task's id.
     pub(crate) fn init(&mut self) {
         task_log!(self.task_id, log::Level::Debug, "Initializing");
         // Seed the step snapshot so observers see the step list before the first run.
@@ -761,29 +1206,59 @@ where
         }
     }
 
-    /// Run the task's steps and fire the success/failure callbacks based on the
-    /// outcome. `on_finish` is fired here only for the terminal `ForceRemoved` state
-    /// (a normally-finishing task fires it from [`Task::reschedule_and_notify`]).
-    pub(crate) async fn run_and_notify(&mut self, run_id: usize) {
-        let _ = self.run_task(run_id).await; // status is updated in place; the result is redundant
-        match self.status {
-            Status::Executed => Self::fire_callback(&mut self.on_success).await,
-            Status::Failed => Self::fire_callback(&mut self.on_failure).await,
-            Status::ForceRemoved => {
-                Self::fire_callback(&mut self.on_failure).await;
-                Self::fire_callback(&mut self.on_finish).await;
+    /// The report of the most recent run.
+    pub(crate) fn last_report(&self) -> Option<RunReport> {
+        Some(RunReport {
+            task_id: self.task_id,
+            task_name: self.name.clone(),
+            record: self.last_run.clone()?,
+            steps: self.step_states.clone(),
+        })
+    }
+
+    /// Fire `on_success` or `on_failure` for a finished run. A cancelled run fires
+    /// neither.
+    pub(crate) async fn notify_run(&mut self, report: &RunReport) {
+        match report.record.outcome {
+            Some(RunOutcome::Success) | Some(RunOutcome::HadErrors) => {
+                Self::fire_callback(self.task_id, &mut self.on_success, report.clone()).await
+            }
+            Some(RunOutcome::Failed) | Some(RunOutcome::ForceRemoved) => {
+                Self::fire_callback(self.task_id, &mut self.on_failure, report.clone()).await
             }
             _ => {}
         }
     }
 
-    /// Reschedule the task and fire `on_finish` if it has just reached the
-    /// `Finished` state (exactly once; force-removed tasks fire it from
-    /// [`Task::run_and_notify`]).
+    /// Run the task's steps and fire `on_success` or `on_failure` based on the outcome.
+    ///
+    /// Returns the run's report, or `None` if the task was not in a runnable state.
+    /// `on_finish` is fired from [`Task::reschedule_and_notify`] or when the task is
+    /// stopped.
+    #[cfg(test)]
+    pub(crate) async fn run_and_notify(&mut self, run_id: usize) -> Option<RunReport> {
+        if self.run_task(run_id).await.is_err() {
+            return None;
+        }
+        let report = self.last_report()?;
+        self.notify_run(&report).await;
+        Some(report)
+    }
+
+    /// Reschedule the task and fire `on_finish` if it has just reached a terminal state
+    /// (`Finished` or `ForceRemoved`).
+    ///
+    /// After a cancelled run nothing changes: the task is being stopped, and its driver
+    /// fires `on_finish` with the stop reason instead of `Completed`.
     pub(crate) async fn reschedule_and_notify(&mut self) {
+        if self.run_cancelled {
+            return;
+        }
         let _ = self.reschedule(); // status is updated in place; the result is redundant
-        if self.status == Status::Finished {
-            Self::fire_callback(&mut self.on_finish).await;
+        match self.status {
+            Status::Finished => self.fire_finish(FinishReason::Completed).await,
+            Status::ForceRemoved => self.fire_finish(FinishReason::ForceRemoved).await,
+            _ => {}
         }
     }
 
@@ -792,10 +1267,21 @@ where
         matches!(self.status, Status::Finished | Status::ForceRemoved)
     }
 
+    /// The reason matching the task's terminal status.
+    pub(crate) fn terminal_reason(&self) -> FinishReason {
+        match self.status {
+            Status::ForceRemoved => FinishReason::ForceRemoved,
+            _ => FinishReason::Completed,
+        }
+    }
+
     /// Classify the outcome of the run that just completed, based on the status and
-    /// the per-step snapshot. Call this after `run_and_notify` and before
-    /// `reschedule`, which would otherwise overwrite the status.
+    /// the per-step snapshot. Call this after `run_task` and before `reschedule`, which
+    /// would otherwise overwrite the status.
     pub(crate) fn run_outcome(&self) -> RunOutcome {
+        if self.run_cancelled {
+            return RunOutcome::Cancelled;
+        }
         match self.status {
             Status::ForceRemoved => RunOutcome::ForceRemoved,
             Status::Failed => RunOutcome::Failed,
@@ -818,10 +1304,46 @@ where
         self.next_exec.as_ref().map(|d| d.with_timezone(&Utc))
     }
 
+    /// If the next scheduled slot is later than the [`MissedRunPolicy`] allows at `now`,
+    /// return that slot.
+    pub(crate) fn missed_slot(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self.missed_runs {
+            MissedRunPolicy::RunOnce => None,
+            MissedRunPolicy::Skip { grace } => {
+                let slot = self.next_exec_utc()?;
+                let late = now.signed_duration_since(slot).to_std().ok()?;
+                (late > grace.max(MIN_MISSED_RUN_GRACE)).then_some(slot)
+            }
+        }
+    }
+
+    /// Whether a scheduled slot came due after `since` and no later than now. Used after
+    /// a run to detect a slot that passed while the run was in progress.
+    pub(crate) fn slot_passed_since(&self, since: &DateTime<Utc>) -> bool {
+        let since = since.with_timezone(&self.timezone);
+        let now = Utc::now().with_timezone(&self.timezone);
+        self.schedule
+            .after(&since)
+            .next()
+            .is_some_and(|slot| slot <= now)
+    }
+
+    /// Move to the next future slot without running, as the [`MissedRunPolicy`]
+    /// requires. Retires the task (and fires `on_finish`) if there is none.
+    pub(crate) async fn skip_to_next_slot(&mut self) {
+        match self.schedule.upcoming(self.timezone.clone()).next() {
+            Some(next) => self.next_exec = Some(next),
+            None => {
+                self.status = Status::Finished;
+                self.fire_finish(FinishReason::Completed).await;
+            }
+        }
+    }
+
     /// Run the task and handle the output.
     ///
     /// `run_id` identifies the current run and is surfaced to each step through its
-    /// [`TaskContext`].
+    /// [`TaskContext`]. On success the run's record is left in `last_run`.
     pub(crate) async fn run_task(&mut self, run_id: usize) -> TaskResult<()> {
         match &self.status {
             Status::Init => Err(TaskError::NotInitialized),
@@ -836,15 +1358,16 @@ where
                     "Executing '{}'",
                     self.description
                 );
+                let started_at = Utc::now();
                 // Snapshot the timeout / retry configuration before borrowing
                 // `self.steps` mutably below.
                 let timeout = self.timeout;
                 let retry = self.retry_policy.clone();
                 let max_attempts = 1 + retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
 
-                // Rebuild the per-step snapshot for this run and reset the attempt count.
+                // Rebuild the per-step snapshot for this run.
                 self.reset_step_states();
-                self.last_attempts = 0;
+                self.run_cancelled = false;
                 // Stream the fresh (all-pending) snapshot so observers see the run begin.
                 self.publish_steps();
 
@@ -854,24 +1377,55 @@ where
                 let task_name: Option<Arc<str>> = self.name.as_deref().map(Arc::from);
                 let task_id = self.task_id;
                 let blackboard = self.blackboard.clone();
+                let cancel = self.cancel.clone();
 
-                let mut had_error: bool = false;
+                let mut attempts_total: usize = 0;
+                let mut failure: Option<(usize, String)> = None;
+                let mut stopped = false;
                 // Iterate by index so `self` is free between step invocations, letting us
                 // stream each transition to the shared cell as it happens.
                 for index in 0..self.steps.len() {
-                    if had_error {
+                    if stopped {
                         break;
                     }
                     // The description is fixed per step; capture it for logging so we do
                     // not hold a borrow of `self.steps` across the awaited step future.
                     let step_desc = self.steps[index].to_string();
-                    // Attempt the step, retrying transient (`Error`) failures and
-                    // timeouts according to the retry policy. `ErrorDelete` and
-                    // success both terminate the attempt loop immediately.
+                    // Attempt the step, retrying `Error` failures and timeouts according
+                    // to the retry policy. `ErrorDelete`, success and cancellation all end
+                    // the attempt loop.
                     let mut attempt: u32 = 0;
                     loop {
+                        if cancel.is_cancelled() {
+                            step_log!(
+                                self.task_id,
+                                index,
+                                log::Level::Info,
+                                "Not started, the task is being stopped - {}",
+                                step_desc
+                            );
+                            self.step_states[index].status = StepStatus::Cancelled;
+                            self.run_cancelled = true;
+                            if attempt > 0 {
+                                // Stopped during a retry backoff: the step had started.
+                                self.publish_steps();
+                                self.emit_step_finished(run_id, index);
+                            }
+                            stopped = true;
+                            break;
+                        }
                         attempt += 1;
-                        self.last_attempts += 1;
+                        attempts_total += 1;
+                        self.step_states[index].status = StepStatus::Running;
+                        self.step_states[index].attempts = attempt;
+                        self.publish_steps();
+                        self.emit(SchedulerEvent::StepStarted {
+                            task_id,
+                            task_name: self.name.clone(),
+                            run_id,
+                            step_index: index,
+                            attempt,
+                        });
 
                         // The context handed to the step for this attempt. Cheap to
                         // build: the stores are `Arc`-backed clones and the name is a
@@ -884,6 +1438,7 @@ where
                             attempt,
                             blackboard: blackboard.clone(),
                             run_store: run_store.clone(),
+                            cancel: cancel.clone(),
                         };
 
                         // Run the step, optionally bounded by the configured timeout.
@@ -895,7 +1450,7 @@ where
                             Some(duration) => {
                                 match tokio::time::timeout(
                                     duration,
-                                    (self.steps[index].function)(ctx),
+                                    call_step(&mut self.steps[index].function, ctx),
                                 )
                                 .await
                                 {
@@ -909,11 +1464,14 @@ where
                                             duration,
                                             step_desc
                                         );
-                                        Err(TaskStepStatusErr::Error)
+                                        Err(TaskStepStatusErr::Error(format!(
+                                            "timed out after {:?}",
+                                            duration
+                                        )))
                                     }
                                 }
                             }
-                            None => (self.steps[index].function)(ctx).await,
+                            None => call_step(&mut self.steps[index].function, ctx).await,
                         };
 
                         match result {
@@ -942,24 +1500,42 @@ where
                                 }
                                 self.status = Status::Executed;
                                 self.publish_steps();
+                                self.emit_step_finished(run_id, index);
                                 break;
                             }
-                            Err(TaskStepStatusErr::ErrorDelete) => {
-                                step_log!(
-                                    self.task_id,
-                                    index,
-                                    log::Level::Error,
-                                    "Execution failed and task is marked for deletion - {}",
-                                    step_desc
-                                );
-                                self.step_states[index].status = StepStatus::Failed;
-                                self.status = Status::ForceRemoved;
-                                self.publish_steps();
-                                had_error = true;
-                                break;
-                            }
-                            Err(TaskStepStatusErr::Error) => {
-                                if (attempt as usize) < max_attempts {
+                            Err(err) => {
+                                self.step_states[index].error = Some(err.reason().to_string());
+                                if !err.is_fatal() && cancel.is_cancelled() {
+                                    // A step that gives up because the task is being
+                                    // stopped is interrupted, not failed: no retry and no
+                                    // `on_failure`.
+                                    step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Info,
+                                        "Stopped early, the task is being stopped: {} - {}",
+                                        err,
+                                        step_desc
+                                    );
+                                    self.step_states[index].status = StepStatus::Cancelled;
+                                    self.run_cancelled = true;
+                                    self.publish_steps();
+                                    self.emit_step_finished(run_id, index);
+                                    stopped = true;
+                                    break;
+                                }
+                                if err.is_fatal() {
+                                    step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Error,
+                                        "Execution failed and task is marked for deletion: {} - {}",
+                                        err,
+                                        step_desc
+                                    );
+                                    self.step_states[index].status = StepStatus::Failed;
+                                    self.status = Status::ForceRemoved;
+                                } else if (attempt as usize) < max_attempts {
                                     // `retry` is guaranteed `Some` here: `max_attempts > 1`
                                     // only when a retry policy is set.
                                     let delay = retry.as_ref().unwrap().jittered_delay(attempt - 1);
@@ -967,37 +1543,54 @@ where
                                         self.task_id,
                                         index,
                                         log::Level::Warn,
-                                        "Execution failed, retrying (attempt {}/{}) after {:?} - {}",
+                                        "Execution failed, retrying (attempt {}/{}) after {:?}: {} - {}",
                                         attempt,
                                         max_attempts,
                                         delay,
+                                        err,
                                         step_desc
                                     );
+                                    self.publish_steps();
                                     if !delay.is_zero() {
-                                        tokio::time::sleep(delay).await;
+                                        // A stop request cuts the backoff short; the loop
+                                        // head then marks the step cancelled.
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(delay) => {}
+                                            _ = cancel.cancelled() => {}
+                                        }
                                     }
                                     continue;
+                                } else {
+                                    step_log!(
+                                        self.task_id,
+                                        index,
+                                        log::Level::Error,
+                                        "Execution failed: {} - {}",
+                                        err,
+                                        step_desc
+                                    );
+                                    self.step_states[index].status = StepStatus::Failed;
+                                    self.status = Status::Failed;
                                 }
-                                step_log!(
-                                    self.task_id,
-                                    index,
-                                    log::Level::Error,
-                                    "Execution failed - {}",
-                                    step_desc
-                                );
-                                self.step_states[index].status = StepStatus::Failed;
-                                self.status = Status::Failed;
+                                failure = Some((index, err.reason().to_string()));
                                 self.publish_steps();
-                                had_error = true;
+                                self.emit_step_finished(run_id, index);
+                                stopped = true;
                                 break;
                             }
                         }
                     }
                 }
-                // Any step still pending was never reached because an earlier step failed.
+                // Any step still pending was never reached, either because an earlier
+                // step failed or because the task is being stopped.
+                let unreached = if self.run_cancelled {
+                    StepStatus::Cancelled
+                } else {
+                    StepStatus::Skipped
+                };
                 for step_state in self.step_states.iter_mut() {
                     if step_state.status == StepStatus::Pending {
-                        step_state.status = StepStatus::Skipped;
+                        step_state.status = unreached.clone();
                     }
                 }
                 // Stream the final per-step outcome (including any skipped steps).
@@ -1006,14 +1599,47 @@ where
                 if self.steps.is_empty() {
                     self.status = Status::Executed
                 }
+                // An interrupted run did not complete; mark it failed so it is never
+                // mistaken for a success. The task is about to stop anyway.
+                if self.run_cancelled && self.status != Status::ForceRemoved {
+                    self.status = Status::Failed;
+                }
 
                 // Reduce the total executions (if set). Saturate at zero so a task
-                // constructed with `repeat(0)` cannot underflow.
-                self.repeats = self.repeats.map(|r| r.saturating_sub(1));
+                // constructed with `repeat(0)` cannot underflow. An interrupted run does
+                // not count.
+                if !self.run_cancelled {
+                    self.repeats = self.repeats.map(|r| r.saturating_sub(1));
+                }
+
+                let outcome = self.run_outcome();
+                let (failed_step, error) = match failure {
+                    Some((index, reason)) => (Some(index), Some(reason)),
+                    None => (None, None),
+                };
+                self.last_run = Some(RunRecord {
+                    run_id,
+                    started_at,
+                    finished_at: Some(Utc::now()),
+                    outcome: Some(outcome),
+                    attempts: attempts_total,
+                    error,
+                    failed_step,
+                });
 
                 Ok(())
             }
         }
+    }
+
+    /// Publish [`SchedulerEvent::StepFinished`] for the step at `index`.
+    fn emit_step_finished(&self, run_id: usize, index: usize) {
+        self.emit(SchedulerEvent::StepFinished {
+            task_id: self.task_id,
+            task_name: self.name.clone(),
+            run_id,
+            step: self.step_states[index].clone(),
+        });
     }
 
     /// Reschedule the current task instance (if needed).
@@ -1031,7 +1657,7 @@ where
                         } else {
                             task_log!(
                                 self.task_id,
-                                log::Level::Warn,
+                                log::Level::Info,
                                 "Has finished its execution cycle and will be removed"
                             );
                             Status::Finished
@@ -1058,7 +1684,7 @@ where
             Status::Finished | Status::ForceRemoved => {
                 task_log!(
                     self.task_id,
-                    log::Level::Warn,
+                    log::Level::Debug,
                     "Will be removed from the queue"
                 );
                 Ok(())
@@ -1082,69 +1708,188 @@ where
     *shared.steps.lock().unwrap() = task.step_states.clone();
 }
 
-/// Execute the task once, fire its lifecycle callbacks, reschedule it and republish
-/// the resulting state. Marks the shared `running` flag around the work and the
-/// `finished` flag if the task became terminal.
-async fn run_once<T>(task: &mut Task<T>, shared: &TaskShared)
+/// Skip the run if it is a scheduled run that starts later than the task's
+/// [`MissedRunPolicy`] allows. Returns whether it was skipped.
+async fn skip_if_missed<T>(task: &mut Task<T>, shared: &TaskShared, kind: RunKind) -> bool
 where
     T: TimeZone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
-    let run_id = shared.start_run(Utc::now());
+    // Triggered and queued runs were asked for explicitly and are never skipped.
+    if kind != RunKind::Scheduled {
+        return false;
+    }
+    let Some(slot) = task.missed_slot(Utc::now()) else {
+        return false;
+    };
+    task_log!(
+        task.task_id,
+        log::Level::Info,
+        "Skipping the run scheduled for {}: it started later than the missed-run policy allows",
+        slot
+    );
+    shared.emit(SchedulerEvent::RunSkipped {
+        task_id: shared.id,
+        task_name: shared.name.clone(),
+        scheduled_for: slot,
+    });
+    task.skip_to_next_slot().await;
+    publish(task, shared);
+    true
+}
+
+/// Handle one run request: apply the missed-run policy, wait for concurrency permits,
+/// execute the task, record the run, fire its callbacks, reschedule it and republish
+/// the result.
+async fn run_once<T>(task: &mut Task<T>, shared: &TaskShared, kind: RunKind)
+where
+    T: TimeZone + Send + 'static,
+    <T as TimeZone>::Offset: Send,
+{
+    if skip_if_missed(task, shared, kind).await {
+        return;
+    }
+
+    // Take the pool and scheduler-wide permits. `waiting` is only reported when a
+    // permit is not free right away. A stop request while waiting abandons the run
+    // before it starts.
+    let limiter = &shared.links.limiter;
+    let pool = shared.pool.as_deref();
+    let permits = match limiter.try_acquire(pool) {
+        Some(permits) => permits,
+        None => {
+            shared.waiting.store(true, Ordering::SeqCst);
+            let acquired = tokio::select! {
+                biased;
+                _ = shared.cancel.cancelled() => None,
+                permits = limiter.acquire(pool) => Some(permits),
+            };
+            shared.waiting.store(false, Ordering::SeqCst);
+            let Some(permits) = acquired else {
+                return;
+            };
+            // The wait may have pushed the run past its grace period.
+            if skip_if_missed(task, shared, kind).await {
+                return;
+            }
+            permits
+        }
+    };
+
+    let started_at = Utc::now();
+    let run_id = shared.start_run(started_at);
     shared.running.store(true, Ordering::SeqCst);
-    task.run_and_notify(run_id).await;
-    // Capture the outcome before `reschedule` overwrites the status.
-    let outcome = task.run_outcome();
+    shared.emit(SchedulerEvent::RunStarted {
+        task_id: shared.id,
+        task_name: shared.name.clone(),
+        run_id,
+    });
+    let ran = task.run_task(run_id).await.is_ok();
+    // Release the permits and publish the record before the callbacks run, so a slow
+    // callback does not hold up other runs and observers already see the result.
+    drop(permits);
+    match task.last_report().filter(|_| ran) {
+        Some(report) => {
+            shared.finish_run(&report.record);
+            shared.emit(SchedulerEvent::RunFinished {
+                report: report.clone(),
+            });
+            task.notify_run(&report).await;
+        }
+        // The task was not runnable; close the record opened above.
+        None => shared.abandon_run(Utc::now()),
+    }
+    // `OverlapPolicy::Queue`: a slot that came due while this run was in progress runs
+    // next, once.
+    if task.overlap == OverlapPolicy::Queue && task.slot_passed_since(&started_at) {
+        shared.pending.store(true, Ordering::SeqCst);
+    }
     task.reschedule_and_notify().await;
     shared.running.store(false, Ordering::SeqCst);
-    shared.finish_run(run_id, Utc::now(), outcome, task.last_attempts);
-    if task.is_terminal() {
-        shared.finished.store(true, Ordering::SeqCst);
-    }
     publish(task, shared);
 }
 
 /// Drive a `Task` in its own Tokio task.
 ///
-/// The task initializes itself, publishes its state to `shared`, then runs once for
-/// each [`TaskCmd::Run`] the scheduler dispatches. Runs never block the scheduler:
-/// the scheduler fire-and-forgets `Run` and observes progress through `shared`. When
-/// a run is queued via [`OverlapPolicy::Queue`], it is drained here once the current
-/// run finishes.
+/// The task initializes itself if needed, publishes its state to `shared`, then runs
+/// once for each [`TaskCmd::Run`] it receives and drains runs queued while it was busy.
+/// It exits when it reaches a terminal state or is asked to stop; on a stop it fires
+/// `on_finish` with the stop reason. Runs never block the scheduler: the scheduler
+/// fire-and-forgets `Run` and observes progress through `shared`.
 pub(crate) async fn run_task<T>(mut task: Task<T>, shared: Arc<TaskShared>)
 where
     T: TimeZone + Send + 'static,
     <T as TimeZone>::Offset: Send,
 {
-    // Wire the shared cell as the step-state sink so step transitions stream live
-    // during each run, then self-initialize and publish the first scheduled time.
-    task.step_sink = Some(shared.clone());
-    task.init();
-    publish(&task, &shared);
-    if task.is_terminal() {
-        shared.finished.store(true, Ordering::SeqCst);
-        return;
+    // Wire the shared cell as the sink so step transitions and events stream live.
+    task.sink = Some(shared.clone());
+    if task.status == Status::Init {
+        task.init();
     }
+    publish(&task, &shared);
 
-    let mut receiver = task
-        .receiver
-        .take()
-        .expect("run_task requires a receiver to be set");
-
-    while let Some(TaskCmd::Run) = receiver.recv().await {
-        run_once(&mut task, &shared).await;
-        if shared.finished.load(Ordering::SeqCst) {
-            break;
-        }
-        // `OverlapPolicy::Queue`: run any occurrence that came due while we were
-        // busy, one at a time, until none remain or the task retires.
-        while shared.pending.swap(false, Ordering::SeqCst) && !task.is_terminal() {
-            run_once(&mut task, &shared).await;
-            if shared.finished.load(Ordering::SeqCst) {
+    if task.is_terminal() {
+        // The schedule has no execution at all.
+        task.fire_finish(FinishReason::Completed).await;
+    } else if let Some(mut receiver) = task.receiver.take() {
+        'driver: loop {
+            let first = tokio::select! {
+                biased;
+                _ = shared.cancel.cancelled() => break 'driver,
+                cmd = receiver.recv() => match cmd {
+                    Some(TaskCmd::Run(kind)) => kind,
+                    None => break 'driver,
+                },
+            };
+            let mut kind = first;
+            loop {
+                run_once(&mut task, &shared, kind).await;
+                if task.is_terminal() || shared.cancel.is_cancelled() {
+                    break 'driver;
+                }
+                // Take a queued request while still holding `dispatched`, so no other
+                // sender can dispatch in between.
+                if shared.pending.swap(false, Ordering::SeqCst) {
+                    kind = RunKind::Queued;
+                    continue;
+                }
+                shared.dispatched.store(false, Ordering::SeqCst);
+                // A trigger may have set `pending` after the swap above while it still
+                // saw `dispatched` held. Whoever wins the flag now owns that request
+                // (see `SchedulerHandle::trigger`).
+                if shared.pending.load(Ordering::SeqCst)
+                    && shared
+                        .dispatched
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    if shared.pending.swap(false, Ordering::SeqCst) {
+                        kind = RunKind::Queued;
+                        continue;
+                    }
+                    shared.dispatched.store(false, Ordering::SeqCst);
+                }
                 break;
             }
+            // The task is idle with a new next execution time.
+            shared.links.wake.notify_one();
+        }
+        if !task.is_terminal() {
+            // Stopped from outside: removal or shutdown.
+            let reason = shared.stop_reason();
+            task_log!(task.task_id, log::Level::Debug, "Stopped ({:?})", reason);
+            task.fire_finish(reason).await;
         }
     }
+
+    let reason = if task.is_terminal() {
+        task.terminal_reason()
+    } else {
+        shared.stop_reason()
+    };
+    shared.report_removed(reason);
+    shared.finished.store(true, Ordering::SeqCst);
+    shared.links.wake.notify_one();
 }
 
 #[cfg(test)]
@@ -1187,7 +1932,7 @@ mod test {
     #[tokio::test]
     async fn normal_task_error_flow_test() {
         let mut task = Task::new("* * * * * *", Some("Test task"), Some(2), Local).unwrap();
-        task.add_step_default(|_ctx| async { Err(Error) });
+        task.add_step_default(|_ctx| async { Err(Error("boom".to_string())) });
         assert_eq!(task.status, Status::Init);
         task.set_id(0);
         task.init();
@@ -1255,7 +2000,7 @@ mod test {
     #[tokio::test]
     async fn test_run_failed_task() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|_ctx| async { Err(Error) });
+        task.add_step_default(|_ctx| async { Err(Error("boom".to_string())) });
         task.set_id(0);
         task.init();
         assert!(task.run_task(0).await.is_ok());
@@ -1303,7 +2048,7 @@ mod test {
     #[tokio::test]
     async fn test_run_failed_delete() {
         let mut task = Task::new("* * * * * * *", None, None, Local).unwrap();
-        task.add_step_default(|_ctx| async { Err(ErrorDelete) });
+        task.add_step_default(|_ctx| async { Err(ErrorDelete("fatal".to_string())) });
         task.set_id(0);
         task.init();
         assert!(task.run_task(0).await.is_ok());
@@ -1395,7 +2140,7 @@ mod test {
         task.add_step_default(|_ctx| async { Ok(Success) });
         task.set_receiver(rx);
 
-        let shared = Arc::new(TaskShared::new(DEFAULT_HISTORY_LIMIT));
+        let shared = Arc::new(TaskShared::new(&task, SchedulerLinks::default()));
         let join = tokio::spawn(run_task(task, shared.clone()));
 
         // After self-initialization the task publishes Scheduled + a next execution.
@@ -1407,7 +2152,7 @@ mod test {
         }
 
         // Dispatch a single run; with repeat(1) the task then retires and the loop ends.
-        tx.send(TaskCmd::Run).await.unwrap();
+        tx.send(TaskCmd::Run(RunKind::Scheduled)).await.unwrap();
         join.await.unwrap();
 
         assert!(shared.finished.load(Ordering::SeqCst));
@@ -1493,7 +2238,7 @@ mod test {
             let counter = counter.clone();
             async move {
                 counter.lock().unwrap().push(2);
-                Err(TaskStepStatusErr::Error)
+                Err(TaskStepStatusErr::error("step 2 failed"))
             }
         });
 
@@ -1523,7 +2268,7 @@ mod test {
         // Create a task with a step that forces removal
         let mut task = Task::new("* * * * * * *", Some("Force removal"), None, Local).unwrap();
         task.add_step("Failing step", |_ctx| async {
-            Err(TaskStepStatusErr::ErrorDelete)
+            Err(TaskStepStatusErr::error_delete("fatal"))
         });
 
         // Initialize and run
@@ -1623,7 +2368,7 @@ mod test {
             async move {
                 // Fail the first two attempts, succeed on the third.
                 if c.fetch_add(1, Ordering::SeqCst) < 2 {
-                    Err(Error)
+                    Err(Error("boom".to_string()))
                 } else {
                     Ok(Success)
                 }
@@ -1650,7 +2395,7 @@ mod test {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Err(Error)
+                Err(Error("boom".to_string()))
             }
         });
         task.init();
@@ -1675,13 +2420,13 @@ mod test {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Err(ErrorDelete)
+                Err(ErrorDelete("fatal".to_string()))
             }
         });
         task.init();
         assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::ForceRemoved);
-        // Called exactly once — no retries.
+        // Called exactly once: no retries.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1727,21 +2472,21 @@ mod test {
         task.add_step_default(|_ctx| async { Ok(Success) });
 
         let s = success.clone();
-        task.on_success = Some(boxed_callback(move || {
+        task.on_success = Some(boxed_callback(move |_| {
             let s = s.clone();
             async move {
                 s.fetch_add(1, Ordering::SeqCst);
             }
         }));
         let f = failure.clone();
-        task.on_failure = Some(boxed_callback(move || {
+        task.on_failure = Some(boxed_callback(move |_| {
             let f = f.clone();
             async move {
                 f.fetch_add(1, Ordering::SeqCst);
             }
         }));
         let fin = finish.clone();
-        task.on_finish = Some(boxed_callback(move || {
+        task.on_finish = Some(boxed_callback(move |_| {
             let fin = fin.clone();
             async move {
                 fin.fetch_add(1, Ordering::SeqCst);
@@ -1771,17 +2516,17 @@ mod test {
         let finish = Arc::new(AtomicUsize::new(0));
 
         let mut task = Task::new("* * * * * * *", Some("Callbacks delete"), None, Utc).unwrap();
-        task.add_step_default(|_ctx| async { Err(ErrorDelete) });
+        task.add_step_default(|_ctx| async { Err(ErrorDelete("fatal".to_string())) });
 
         let f = failure.clone();
-        task.on_failure = Some(boxed_callback(move || {
+        task.on_failure = Some(boxed_callback(move |_| {
             let f = f.clone();
             async move {
                 f.fetch_add(1, Ordering::SeqCst);
             }
         }));
         let fin = finish.clone();
-        task.on_finish = Some(boxed_callback(move || {
+        task.on_finish = Some(boxed_callback(move |_| {
             let fin = fin.clone();
             async move {
                 fin.fetch_add(1, Ordering::SeqCst);
@@ -1791,8 +2536,9 @@ mod test {
         task.set_id(0);
         task.init();
 
-        // ForceRemoved is terminal, so run_and_notify fires both on_failure and on_finish.
+        // The run fires on_failure; ForceRemoved is terminal, so the reschedule fires on_finish.
         task.run_and_notify(0).await;
+        task.reschedule_and_notify().await;
 
         assert_eq!(failure.load(Ordering::SeqCst), 1);
         assert_eq!(finish.load(Ordering::SeqCst), 1);
@@ -1803,7 +2549,7 @@ mod test {
     async fn test_step_states_track_outcomes() {
         let mut task = Task::new("* * * * * * *", Some("Steps"), Some(1), Utc).unwrap();
         task.add_step("ok", |_ctx| async { Ok(Success) });
-        task.add_step("boom", |_ctx| async { Err(Error) });
+        task.add_step("boom", |_ctx| async { Err(Error("boom".to_string())) });
         task.add_step("never", |_ctx| async { Ok(Success) });
         task.set_id(0);
         task.init();
@@ -1820,7 +2566,13 @@ mod test {
         assert_eq!(task.step_states[0].status, StepStatus::Succeeded);
         assert_eq!(task.step_states[1].status, StepStatus::Failed);
         assert_eq!(task.step_states[2].status, StepStatus::Skipped);
-        assert_eq!(task.last_attempts, 2);
+        assert_eq!(task.last_run.as_ref().unwrap().attempts, 2);
+        assert_eq!(task.step_states[1].error.as_deref(), Some("boom"));
+        assert_eq!(task.last_run.as_ref().unwrap().failed_step, Some(1));
+        assert_eq!(
+            task.last_run.as_ref().unwrap().error.as_deref(),
+            Some("boom")
+        );
     }
 
     /// A step returning `HadErrors` classifies the run outcome as `HadErrors`. (Layer 0)
@@ -1843,9 +2595,9 @@ mod test {
         task.add_step_default(|_ctx| async { Ok(Success) });
         task.init();
 
-        let shared = TaskShared::new(task.history_limit);
+        let shared = TaskShared::new(&task, SchedulerLinks::default());
         for _ in 0..3 {
-            run_once(&mut task, &shared).await;
+            run_once(&mut task, &shared, RunKind::Scheduled).await;
         }
 
         let hist = shared.history.lock().unwrap().clone();
@@ -1873,8 +2625,8 @@ mod test {
         task.add_step_default(|_ctx| async { Ok(Success) });
         task.init();
 
-        let shared = TaskShared::new(task.history_limit);
-        run_once(&mut task, &shared).await;
+        let shared = TaskShared::new(&task, SchedulerLinks::default());
+        run_once(&mut task, &shared, RunKind::Scheduled).await;
 
         assert!(shared.history.lock().unwrap().is_empty());
         assert_eq!(shared.runs.load(Ordering::SeqCst), 1);
@@ -1908,18 +2660,19 @@ mod test {
         });
         task.set_receiver(rx);
 
-        let shared = Arc::new(TaskShared::new(DEFAULT_HISTORY_LIMIT));
+        let shared = Arc::new(TaskShared::new(&task, SchedulerLinks::default()));
         let join = tokio::spawn(run_task(task, shared.clone()));
 
         // Dispatch a run and wait until step 1 is mid-flight.
-        tx.send(TaskCmd::Run).await.unwrap();
+        tx.send(TaskCmd::Run(RunKind::Scheduled)).await.unwrap();
         ready.notified().await;
 
-        // Live snapshot: step 0 already succeeded while step 1 is still pending.
+        // Live snapshot: step 0 already succeeded while step 1 is still running.
         {
             let steps = shared.steps.lock().unwrap();
             assert_eq!(steps[0].status, StepStatus::Succeeded);
-            assert_eq!(steps[1].status, StepStatus::Pending);
+            assert_eq!(steps[1].status, StepStatus::Running);
+            assert_eq!(steps[1].attempts, 1);
         }
 
         // Let step 1 finish; the run completes and, with repeat(1), the task retires.
@@ -1939,6 +2692,8 @@ mod test {
             index: 0,
             description: Some("s".to_string()),
             status: StepStatus::Succeeded,
+            attempts: 1,
+            error: None,
         };
         let json = serde_json::to_string(&step).unwrap();
         assert_eq!(serde_json::from_str::<StepState>(&json).unwrap(), step);
@@ -1953,6 +2708,8 @@ mod test {
             finished_at: Some(Utc.timestamp_opt(1_700_000_001, 0).unwrap()),
             outcome: Some(RunOutcome::HadErrors),
             attempts: 2,
+            error: Some("boom".to_string()),
+            failed_step: Some(1),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<RunRecord>(&json).unwrap(), record);
@@ -2069,7 +2826,7 @@ mod test {
             async move {
                 a.lock().unwrap().push(ctx.attempt());
                 if ctx.attempt() < 3 {
-                    Err(Error)
+                    Err(Error("boom".to_string()))
                 } else {
                     Ok(Success)
                 }
@@ -2079,5 +2836,623 @@ mod test {
         assert!(task.run_task(0).await.is_ok());
         assert_eq!(task.status, Status::Executed);
         assert_eq!(*attempts.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// Collect the events published so far on a receiver.
+    fn drain_events(rx: &mut broadcast::Receiver<SchedulerEvent>) -> Vec<SchedulerEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// A failing step's reason, attempt count and index reach the step state and the
+    /// run record. (P4)
+    #[tokio::test]
+    async fn test_error_reason_recorded() {
+        use crate::retry::RetryPolicy;
+        let mut task = Task::new("* * * * * *", None, Some(1), Utc).unwrap();
+        task.set_retry_policy(RetryPolicy::fixed(1, Duration::from_millis(0)));
+        task.add_step("ok", |_ctx| async { Ok(Success) });
+        task.add_step("db", |_ctx| async {
+            Err(TaskStepStatusErr::error("database unavailable"))
+        });
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+
+        let step = &task.step_states[1];
+        assert_eq!(step.status, StepStatus::Failed);
+        assert_eq!(step.attempts, 2);
+        assert_eq!(step.error.as_deref(), Some("database unavailable"));
+        assert_eq!(task.step_states[0].attempts, 1);
+        assert_eq!(task.step_states[0].error, None);
+
+        let record = task.last_run.clone().unwrap();
+        assert_eq!(record.outcome, Some(RunOutcome::Failed));
+        assert_eq!(record.failed_step, Some(1));
+        assert_eq!(record.error.as_deref(), Some("database unavailable"));
+        assert_eq!(record.attempts, 3);
+        assert!(record.finished_at.is_some());
+    }
+
+    /// A timed-out attempt reports the timeout as its reason. (P4)
+    #[tokio::test]
+    async fn test_timeout_reason_recorded() {
+        let mut task = Task::new("* * * * * *", None, Some(1), Utc).unwrap();
+        task.set_timeout(Duration::from_millis(20));
+        task.add_step_default(|_ctx| async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(Success)
+        });
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+        let error = task.step_states[0].error.clone().unwrap();
+        assert!(error.starts_with("timed out after"), "got {error}");
+    }
+
+    /// `TaskStepStatusErr` helpers expose the reason and severity. (P4)
+    #[test]
+    fn test_step_error_helpers() {
+        let err = TaskStepStatusErr::error("retry me");
+        assert_eq!(err, Error("retry me".to_string()));
+        assert_eq!(err.reason(), "retry me");
+        assert_eq!(err.to_string(), "retry me");
+        assert!(!err.is_fatal());
+        let fatal = TaskStepStatusErr::error_delete("gone");
+        assert_eq!(fatal, ErrorDelete("gone".to_string()));
+        assert!(fatal.is_fatal());
+    }
+
+    /// `on_success` and `on_failure` receive the run report, `on_finish` the reason and
+    /// the last run. (P4)
+    #[tokio::test]
+    async fn test_callbacks_receive_reports() {
+        let reports = Arc::new(Mutex::new(Vec::<RunReport>::new()));
+        let finishes = Arc::new(Mutex::new(Vec::<FinishReport>::new()));
+        let mut task = Task::new("* * * * * *", None, Some(2), Utc).unwrap();
+        task.set_id(4);
+        task.set_name("reporter");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        task.add_step("flip", move |_ctx| {
+            let c = c.clone();
+            async move {
+                // Succeed on the first run, fail on the second.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Success)
+                } else {
+                    Err(TaskStepStatusErr::error("second run fails"))
+                }
+            }
+        });
+        let r = reports.clone();
+        let r2 = reports.clone();
+        let f = finishes.clone();
+        task.set_callbacks(
+            Some(boxed_callback(move |report: RunReport| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push(report) }
+            })),
+            Some(boxed_callback(move |report: RunReport| {
+                let r = r2.clone();
+                async move { r.lock().unwrap().push(report) }
+            })),
+            Some(boxed_callback(move |report: FinishReport| {
+                let f = f.clone();
+                async move { f.lock().unwrap().push(report) }
+            })),
+        );
+        task.init();
+        for run_id in 0..2 {
+            assert!(task.run_and_notify(run_id).await.is_some());
+            task.reschedule_and_notify().await;
+        }
+
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].task_id, 4);
+        assert_eq!(reports[0].task_name.as_deref(), Some("reporter"));
+        assert_eq!(reports[0].record.outcome, Some(RunOutcome::Success));
+        assert_eq!(reports[1].record.run_id, 1);
+        assert_eq!(reports[1].record.outcome, Some(RunOutcome::Failed));
+        assert_eq!(reports[1].record.error.as_deref(), Some("second run fails"));
+        assert_eq!(reports[1].steps[0].status, StepStatus::Failed);
+
+        let finishes = finishes.lock().unwrap();
+        assert_eq!(finishes.len(), 1, "on_finish fires once");
+        assert_eq!(finishes[0].reason, FinishReason::Completed);
+        assert_eq!(finishes[0].last_run.as_ref().unwrap().run_id, 1);
+    }
+
+    /// A task stopped before its run starts marks every step cancelled, records a
+    /// cancelled run and fires neither `on_success` nor `on_failure`. (P1)
+    #[tokio::test]
+    async fn test_cancelled_before_run() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.add_step("a", |_ctx| async { Ok(Success) });
+        task.add_step("b", |_ctx| async { Ok(Success) });
+        let f1 = fired.clone();
+        let f2 = fired.clone();
+        task.set_callbacks(
+            Some(boxed_callback(move |_| {
+                let f = f1.clone();
+                async move {
+                    f.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            Some(boxed_callback(move |_| {
+                let f = f2.clone();
+                async move {
+                    f.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            None,
+        );
+        task.init();
+        task.cancel.cancel();
+
+        let report = task.run_and_notify(0).await.unwrap();
+        assert_eq!(report.record.outcome, Some(RunOutcome::Cancelled));
+        assert!(report
+            .steps
+            .iter()
+            .all(|s| s.status == StepStatus::Cancelled && s.attempts == 0));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+    }
+
+    /// A step that gives up after seeing the stop request is cancelled rather than
+    /// failed: it is not retried and later steps do not run. (P1)
+    #[tokio::test]
+    async fn test_cooperative_cancellation_mid_run() {
+        use crate::retry::RetryPolicy;
+        let token = CancelToken::new();
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.cancel = token.clone();
+        task.set_retry_policy(RetryPolicy::fixed(3, Duration::from_millis(0)));
+        let second_ran = Arc::new(AtomicBool::new(false));
+        task.add_step("long", move |ctx| {
+            let token = token.clone();
+            async move {
+                assert!(!ctx.is_cancelled());
+                // Simulate a stop request arriving while the step is waiting.
+                token.cancel();
+                ctx.cancelled().await;
+                assert!(ctx.is_cancelled());
+                Err(TaskStepStatusErr::error("interrupted"))
+            }
+        });
+        let s = second_ran.clone();
+        task.add_step("after", move |_ctx| {
+            let s = s.clone();
+            async move {
+                s.store(true, Ordering::SeqCst);
+                Ok(Success)
+            }
+        });
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+
+        assert_eq!(task.step_states[0].status, StepStatus::Cancelled);
+        assert_eq!(task.step_states[0].attempts, 1, "no retry after a stop");
+        assert_eq!(task.step_states[0].error.as_deref(), Some("interrupted"));
+        assert_eq!(task.step_states[1].status, StepStatus::Cancelled);
+        assert!(!second_ran.load(Ordering::SeqCst));
+        assert_eq!(task.run_outcome(), RunOutcome::Cancelled);
+        assert_eq!(task.last_run.as_ref().unwrap().failed_step, None);
+    }
+
+    /// A stop request cuts a retry backoff short. (P1)
+    #[tokio::test]
+    async fn test_cancel_interrupts_backoff() {
+        use crate::retry::RetryPolicy;
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_retry_policy(RetryPolicy::fixed(5, Duration::from_secs(30)));
+        task.add_step_default(|_ctx| async { Err(TaskStepStatusErr::error("flaky")) });
+        task.init();
+        let token = task.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+        tokio::time::timeout(Duration::from_secs(2), task.run_task(0))
+            .await
+            .expect("the backoff sleep must end on cancellation")
+            .unwrap();
+        assert_eq!(task.step_states[0].status, StepStatus::Cancelled);
+        assert_eq!(task.run_outcome(), RunOutcome::Cancelled);
+    }
+
+    /// `missed_slot` reports a late slot only under `Skip` and only past the grace
+    /// period. (P3)
+    #[test]
+    fn test_missed_slot_policy() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.init();
+        let now = Utc::now();
+        task.next_exec = Some(now - chrono::Duration::seconds(10));
+
+        assert_eq!(task.missed_slot(now), None, "RunOnce never skips");
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::from_secs(1),
+        });
+        assert_eq!(task.missed_slot(now), task.next_exec_utc());
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::from_secs(60),
+        });
+        assert_eq!(task.missed_slot(now), None, "within the grace period");
+        // A slot in the future is never late.
+        task.next_exec = Some(now + chrono::Duration::seconds(10));
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::ZERO,
+        });
+        assert_eq!(task.missed_slot(now), None);
+    }
+
+    /// `slot_passed_since` detects a slot that came due after the given time. (P3)
+    #[test]
+    fn test_slot_passed_since() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.init();
+        assert!(task.slot_passed_since(&(Utc::now() - chrono::Duration::seconds(3))));
+        // The next per-second slot after "now" lies in the future.
+        assert!(!task.slot_passed_since(&Utc::now()));
+    }
+
+    /// A late scheduled run is skipped under `Skip`, publishing `RunSkipped` and moving
+    /// to a future slot, while a triggered run of the same late slot executes. (P3)
+    #[tokio::test]
+    async fn test_run_once_applies_missed_run_policy() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::from_secs(1),
+        });
+        task.add_step_default(move |_ctx| {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(Success)
+            }
+        });
+        task.init();
+        let shared = TaskShared::new(&task, SchedulerLinks::default());
+        let mut events = shared.links.events.subscribe();
+
+        let late = Utc::now() - chrono::Duration::seconds(30);
+        task.next_exec = Some(late);
+        run_once(&mut task, &shared, RunKind::Scheduled).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the late run is skipped");
+        assert!(task.next_exec_utc().unwrap() > Utc::now() - chrono::Duration::seconds(1));
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::RunSkipped { scheduled_for, .. } if *scheduled_for == late
+        )));
+        assert!(shared.history.lock().unwrap().is_empty());
+
+        task.next_exec = Some(late);
+        run_once(&mut task, &shared, RunKind::Triggered).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a triggered run always executes"
+        );
+    }
+
+    /// `run_once` publishes run and step events in order. (P2)
+    #[tokio::test]
+    async fn test_run_once_publishes_events() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_id(2);
+        task.set_name("evented");
+        task.add_step("only", |_ctx| async { Ok(Success) });
+        task.init();
+        let shared = Arc::new(TaskShared::new(&task, SchedulerLinks::default()));
+        task.sink = Some(shared.clone());
+        let mut events = shared.links.events.subscribe();
+
+        run_once(&mut task, &shared, RunKind::Scheduled).await;
+        let events = drain_events(&mut events);
+        assert!(matches!(
+            &events[0],
+            SchedulerEvent::RunStarted { task_id: 2, task_name: Some(n), run_id: 0 } if n == "evented"
+        ));
+        assert!(matches!(
+            &events[1],
+            SchedulerEvent::StepStarted {
+                step_index: 0,
+                attempt: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[2],
+            SchedulerEvent::StepFinished { step, .. } if step.status == StepStatus::Succeeded
+        ));
+        match &events[3] {
+            SchedulerEvent::RunFinished { report } => {
+                assert_eq!(report.task_id, 2);
+                assert_eq!(report.record.outcome, Some(RunOutcome::Success));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[3].task_id(), Some(2));
+    }
+
+    /// `last_outcome` is kept when history is disabled and is not cleared while a run is
+    /// in progress. (F8)
+    #[tokio::test]
+    async fn test_last_outcome_without_history() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_history_limit(0);
+        task.add_step_default(|_ctx| async { Ok(Success) });
+        task.init();
+        let shared = TaskShared::new(&task, SchedulerLinks::default());
+        run_once(&mut task, &shared, RunKind::Scheduled).await;
+        assert!(shared.history.lock().unwrap().is_empty());
+        assert_eq!(
+            *shared.last_outcome.lock().unwrap(),
+            Some(RunOutcome::Success)
+        );
+        // Starting another run leaves the previous outcome in place.
+        shared.start_run(Utc::now());
+        assert_eq!(
+            *shared.last_outcome.lock().unwrap(),
+            Some(RunOutcome::Success)
+        );
+    }
+
+    /// `abandon_run` closes an unfinished record as cancelled. (P1)
+    #[test]
+    fn test_abandon_run_marks_cancelled() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.init();
+        let shared = TaskShared::new(&task, SchedulerLinks::default());
+        shared.start_run(Utc::now());
+        shared.running.store(true, Ordering::SeqCst);
+        shared.abandon_run(Utc::now());
+        let history = shared.history.lock().unwrap();
+        assert_eq!(history[0].outcome, Some(RunOutcome::Cancelled));
+        assert!(history[0].finished_at.is_some());
+        assert!(!shared.running.load(Ordering::SeqCst));
+        assert_eq!(
+            *shared.last_outcome.lock().unwrap(),
+            Some(RunOutcome::Cancelled)
+        );
+    }
+
+    /// A schedule with no execution at all retires the task at once and fires
+    /// `on_finish` with `Completed`.
+    #[tokio::test]
+    async fn test_driver_without_upcoming_fires_finish() {
+        let reasons = Arc::new(Mutex::new(Vec::<FinishReason>::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        // A fixed year in the past has no upcoming slot.
+        let mut task = Task::new("0 0 0 1 1 * 2000", None, None, Utc).unwrap();
+        task.set_receiver(rx);
+        let r = reasons.clone();
+        task.set_callbacks(
+            None,
+            None,
+            Some(boxed_callback(move |report: FinishReport| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push(report.reason) }
+            })),
+        );
+        let shared = Arc::new(TaskShared::new(&task, SchedulerLinks::default()));
+        let mut events = shared.links.events.subscribe();
+        run_task(task, shared.clone()).await;
+
+        assert!(shared.finished.load(Ordering::SeqCst));
+        assert_eq!(*reasons.lock().unwrap(), vec![FinishReason::Completed]);
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            SchedulerEvent::TaskRemoved {
+                reason: FinishReason::Completed,
+                ..
+            }
+        )));
+    }
+
+    /// An idle driver exits on a stop request and fires `on_finish` with the recorded
+    /// reason, publishing `TaskRemoved` once. (P1, F2)
+    #[tokio::test]
+    async fn test_driver_stops_on_request() {
+        let reasons = Arc::new(Mutex::new(Vec::<FinishReason>::new()));
+        let (_tx, rx) = mpsc::channel(1);
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_receiver(rx);
+        let r = reasons.clone();
+        task.set_callbacks(
+            None,
+            None,
+            Some(boxed_callback(move |report: FinishReport| {
+                let r = r.clone();
+                async move { r.lock().unwrap().push(report.reason) }
+            })),
+        );
+        task.init();
+        let shared = Arc::new(TaskShared::new(&task, SchedulerLinks::default()));
+        let mut events = shared.links.events.subscribe();
+        let join = tokio::spawn(run_task(task, shared.clone()));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shared.request_stop(FinishReason::Removed);
+        // A later reason does not override the first.
+        shared.request_stop(FinishReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("driver must exit on a stop request")
+            .unwrap();
+
+        assert_eq!(*reasons.lock().unwrap(), vec![FinishReason::Removed]);
+        let removed: Vec<_> = drain_events(&mut events)
+            .into_iter()
+            .filter(|e| matches!(e, SchedulerEvent::TaskRemoved { .. }))
+            .collect();
+        assert_eq!(removed.len(), 1);
+        // Reporting again is a no-op.
+        shared.report_removed(FinishReason::Shutdown);
+        assert!(events.try_recv().is_err());
+    }
+
+    /// A grace period below one second is raised to one second, so on-time runs that
+    /// start a few milliseconds after their slot are not skipped. (review #6)
+    #[test]
+    fn test_skip_grace_has_a_floor() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.init();
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::ZERO,
+        });
+        let now = Utc::now();
+        task.next_exec = Some(now - chrono::Duration::milliseconds(500));
+        assert_eq!(task.missed_slot(now), None, "500 ms late is on time");
+        task.next_exec = Some(now - chrono::Duration::milliseconds(1500));
+        assert_eq!(task.missed_slot(now), task.next_exec_utc());
+    }
+
+    /// A scheduled run that waited for a permit past its grace period is skipped once
+    /// the permit arrives. (review #7)
+    #[tokio::test]
+    async fn test_skip_is_checked_again_after_waiting_for_a_permit() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let mut task = Task::new("0 0 0 1 1 * 2099", None, None, Utc).unwrap();
+        task.set_missed_runs(MissedRunPolicy::Skip {
+            grace: Duration::from_secs(1),
+        });
+        task.add_step_default(move |_ctx| {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(Success)
+            }
+        });
+        task.init();
+        let links = SchedulerLinks::default();
+        links.limiter.set_global(1);
+        let shared = Arc::new(TaskShared::new(&task, links));
+        let mut events = shared.links.events.subscribe();
+        // Due right now, so the first check lets it through.
+        task.next_exec = Some(Utc::now());
+        let blocker = shared.links.limiter.acquire(None).await;
+
+        let s = shared.clone();
+        let join = tokio::spawn(async move {
+            run_once(&mut task, &s, RunKind::Scheduled).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(shared.waiting.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        drop(blocker);
+        join.await.unwrap();
+
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(!shared.waiting.load(Ordering::SeqCst));
+        assert!(drain_events(&mut events)
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::RunSkipped { .. })));
+    }
+
+    /// `waiting` is not reported when a permit is free. (review of P5)
+    #[tokio::test]
+    async fn test_waiting_not_set_when_permit_is_free() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        let links = SchedulerLinks::default();
+        links.limiter.set_global(1);
+        let shared = Arc::new(TaskShared::new(&task, links));
+        let seen = Arc::new(AtomicBool::new(false));
+        let (s, w) = (shared.clone(), seen.clone());
+        task.add_step_default(move |_ctx| {
+            let (s, w) = (s.clone(), w.clone());
+            async move {
+                w.store(s.waiting.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(Success)
+            }
+        });
+        task.init();
+        run_once(&mut task, &shared, RunKind::Triggered).await;
+        assert!(!seen.load(Ordering::SeqCst));
+        assert_eq!(shared.runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Permits are released and the run is recorded before `on_success` runs, so a
+    /// slow callback does not hold up other runs. (review #8)
+    #[tokio::test]
+    async fn test_permits_released_before_callbacks() {
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        let links = SchedulerLinks::default();
+        links.limiter.set_global(1);
+        let shared = Arc::new(TaskShared::new(&task, links));
+        let observed = Arc::new(Mutex::new(None));
+        let (s, o) = (shared.clone(), observed.clone());
+        task.add_step_default(|_ctx| async { Ok(Success) });
+        task.set_callbacks(
+            Some(boxed_callback(move |_| {
+                let (s, o) = (s.clone(), o.clone());
+                async move {
+                    let permit_free = s.links.limiter.try_acquire(None).is_some();
+                    let recorded = s.history.lock().unwrap()[0].outcome.clone();
+                    *o.lock().unwrap() = Some((permit_free, recorded));
+                }
+            })),
+            None,
+            None,
+        );
+        task.init();
+        run_once(&mut task, &shared, RunKind::Triggered).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((true, Some(RunOutcome::Success)))
+        );
+    }
+
+    /// A panicking step fails the attempt with the panic message; retries still apply.
+    /// (review #3)
+    #[tokio::test]
+    async fn test_step_panic_becomes_error() {
+        use crate::retry::RetryPolicy;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut task = Task::new("* * * * * *", None, None, Utc).unwrap();
+        task.set_retry_policy(RetryPolicy::fixed(1, Duration::from_millis(0)));
+        task.add_step_default(move |_ctx| {
+            // Panics while creating the future on the first attempt, succeeds after.
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("sync boom");
+            }
+            async { Ok(Success) }
+        });
+        task.add_step_default(|_ctx| async { panic!("async boom") });
+        task.init();
+        assert!(task.run_task(0).await.is_ok());
+        assert_eq!(task.step_states[0].status, StepStatus::Succeeded);
+        assert_eq!(task.step_states[0].attempts, 2);
+        assert_eq!(task.step_states[1].status, StepStatus::Failed);
+        assert_eq!(
+            task.step_states[1].error.as_deref(),
+            Some("step panicked: async boom")
+        );
+    }
+
+    /// A cancelled run does not use up a repeat and leaves the status for the stop
+    /// reason to decide. (review #5)
+    #[tokio::test]
+    async fn test_cancelled_run_keeps_repeat() {
+        let mut task = Task::new("* * * * * *", None, Some(1), Utc).unwrap();
+        task.add_step_default(|_ctx| async { Ok(Success) });
+        task.init();
+        task.cancel.cancel();
+        assert!(task.run_task(0).await.is_ok());
+        assert_eq!(task.repeats, Some(1));
+        task.reschedule_and_notify().await;
+        assert!(
+            !task.is_terminal(),
+            "no Completed transition after a cancel"
+        );
     }
 }

@@ -1,66 +1,103 @@
-//! An asynchronous task scheduling library written in Rust.
+//! An asynchronous, cron-style task scheduler for Tokio.
 //!
-//! `tasklet` allows you to create scheduled tasks with specific execution patterns and
-//! run them asynchronously using Tokio. It supports cron-like scheduling expressions and
-//! provides a builder pattern for easy task creation.
+//! A task is a cron schedule plus a list of async steps. [`TaskBuilder`] builds tasks,
+//! [`TaskScheduler`] runs them (each task in its own Tokio task, so a slow task never
+//! delays the others), and a [`SchedulerHandle`] observes and controls the scheduler
+//! while it runs.
 //!
 //! # Highlights
 //!
-//! * **Async steps** — every task step is a closure returning a future, so steps can
-//!   `.await` real asynchronous work (I/O, timers, ...) without blocking the runtime.
-//!   Each step is handed a [`TaskContext`] identifying the run (task id/name, run id,
-//!   step index, attempt) and giving access to a task-level [`Blackboard`] plus a
-//!   per-run store for passing values between steps within a run.
-//! * **Graceful shutdown** — obtain a [`SchedulerHandle`] via
-//!   [`TaskScheduler::handle`] before running and call `shutdown()` to stop the scheduler
-//!   cleanly, or drive shutdown with any future via [`TaskScheduler::run_until`].
-//! * **Resilience** — configure a per-step [`TaskBuilder::timeout`], a
-//!   [`RetryPolicy`] (with optional [`Jitter`]) via [`TaskBuilder::retry`], and async
-//!   lifecycle callbacks ([`TaskBuilder::on_success`] /
-//!   [`on_failure`](TaskBuilder::on_failure) / [`on_finish`](TaskBuilder::on_finish)).
-//! * **Non-blocking scheduling** — a slow task never delays other tasks. Control what
-//!   happens when a run overruns its interval with an [`OverlapPolicy`] via
-//!   [`TaskBuilder::overlap`].
-//! * **Observability** — query the live task set at runtime through
-//!   [`SchedulerHandle::task_count`] / [`SchedulerHandle::statuses`], including per-task
-//!   run history ([`SchedulerHandle::history`]) and per-step state
-//!   ([`SchedulerHandle::step_states`]), which streams step transitions live during a run.
-//! * **Schedule helpers** — build common cadences without raw cron:
-//!   [`TaskBuilder::every_seconds`], [`every_minutes`](TaskBuilder::every_minutes),
-//!   [`every_hours`](TaskBuilder::every_hours), [`hourly_at`](TaskBuilder::hourly_at) and
-//!   [`daily_at`](TaskBuilder::daily_at). Capture a task's id with
-//!   [`TaskScheduler::add_task_get_id`].
-//! * **Runtime control** — name a task with [`TaskBuilder::name`] and pause, resume,
-//!   trigger or remove it at runtime through a [`SchedulerHandle`], by id or by name.
-//!   Add tasks to a running scheduler with a [`TaskSpawner`] obtained from
-//!   [`TaskScheduler::spawner`].
-//! * **Shared data** — pass values between tasks and steps with a cheaply-clonable,
-//!   typed [`Blackboard`].
+//! * **Async steps.** Every step is a closure returning a future, so it can `.await`
+//!   I/O and timers without blocking the runtime. Each step receives a [`TaskContext`]
+//!   with the task id and name, run id, step index and attempt, a task-level
+//!   [`Blackboard`] shared across runs, and a per-run store for passing values between
+//!   steps.
+//! * **Failures with reasons.** A step fails with
+//!   [`TaskStepStatusErr::error`](task::TaskStepStatusErr::error) (retryable) or
+//!   [`TaskStepStatusErr::error_delete`](task::TaskStepStatusErr::error_delete)
+//!   (removes the task). The reason is kept in [`StepState::error`] and
+//!   [`RunRecord::error`].
+//! * **Timeouts, retries and callbacks.** Set a per-attempt [`TaskBuilder::timeout`], a
+//!   [`RetryPolicy`] (with optional [`Jitter`]) through [`TaskBuilder::retry`], and async
+//!   callbacks: [`TaskBuilder::on_success`] and [`on_failure`](TaskBuilder::on_failure)
+//!   receive a [`RunReport`], [`on_finish`](TaskBuilder::on_finish) receives a
+//!   [`FinishReport`] with the [`FinishReason`].
+//! * **Scheduling.** Use cron expressions or the helpers [`TaskBuilder::every_seconds`],
+//!   [`every_minutes`](TaskBuilder::every_minutes), [`every_hours`](TaskBuilder::every_hours),
+//!   [`hourly_at`](TaskBuilder::hourly_at) and [`daily_at`](TaskBuilder::daily_at). The
+//!   scheduler sleeps until the next task is due, so runs start on their slot. An
+//!   [`OverlapPolicy`] decides what happens when a slot comes due during a run, and a
+//!   [`MissedRunPolicy`] what happens to a run that starts late.
+//! * **Concurrency limits.** Cap runs in progress with
+//!   [`TaskScheduler::max_concurrent_runs`], or per named pool with
+//!   [`TaskScheduler::add_pool`] and [`TaskBuilder::pool`].
+//! * **Runtime control.** Name a task with [`TaskBuilder::name`] and pause, resume,
+//!   trigger or remove it through a [`SchedulerHandle`], by id or by name. Add tasks to
+//!   a running scheduler with a [`TaskSpawner`] from [`TaskScheduler::spawner`], or from
+//!   a [`TaskGenerator`].
+//! * **Graceful shutdown.** [`SchedulerHandle::shutdown`] or
+//!   [`TaskScheduler::run_until`] stop the scheduler. Removed and stopping tasks see the
+//!   request through [`TaskContext::is_cancelled`] and [`TaskContext::cancelled`]; runs
+//!   in progress get a [grace period](TaskScheduler::grace_period) (5 seconds by default)
+//!   and are aborted after it. `TaskScheduler` is `Send`, so it can run inside
+//!   `tokio::spawn`.
+//! * **Observability.** Read task snapshots ([`SchedulerHandle::statuses`]), run history
+//!   ([`SchedulerHandle::history`]) and live step states
+//!   ([`SchedulerHandle::step_states`]), or subscribe to a stream of [`SchedulerEvent`]s
+//!   with [`SchedulerHandle::subscribe`]. With the `serde` feature, these types implement
+//!   `Serialize` and `Deserialize`.
+//!
+//! Guides and the migration guide for each breaking release are in the
+//! [`docs` folder](https://github.com/stav121/tasklet/tree/main/docs) of the repository.
 //!
 //! # Example
 //!
 //! ```no_run
+//! use tasklet::task::TaskStepStatusErr;
 //! use tasklet::task::TaskStepStatusOk::Success;
 //! use tasklet::{TaskBuilder, TaskScheduler};
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let mut scheduler = TaskScheduler::default(chrono::Local);
-//!     let _ = scheduler.add_task(
-//!         TaskBuilder::new(chrono::Local)
-//!             .every("1 * * * * * *")
-//!             .description("A simple task")
-//!             .add_step("Step 1", |_ctx| async { Ok(Success) })
-//!             .build(),
-//!     );
+//!     scheduler
+//!         .add_task(
+//!             TaskBuilder::new(chrono::Local)
+//!                 .every("1 * * * * * *")
+//!                 .description("A simple task")
+//!                 .add_step("Step 1", |_ctx| async { Ok(Success) })
+//!                 .add_step("Step 2", |ctx| async move {
+//!                     if ctx.run_id() % 2 == 0 {
+//!                         Ok(Success)
+//!                     } else {
+//!                         Err(TaskStepStatusErr::error("odd run"))
+//!                     }
+//!                 })
+//!                 .on_failure(|report| async move {
+//!                     eprintln!("run failed: {:?}", report.record.error);
+//!                 })
+//!                 .build(),
+//!         )
+//!         .unwrap();
+//!
+//!     // Stop after an hour; a run in progress gets the grace period to finish.
+//!     let handle = scheduler.handle();
+//!     tokio::spawn(async move {
+//!         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+//!         handle.shutdown();
+//!     });
+//!
 //!     scheduler.run().await;
 //! }
 //! ```
 
 mod blackboard;
 mod builders;
+mod cancel;
 pub mod errors;
+pub mod events;
 mod generator;
+mod limits;
 pub mod retry;
 mod scheduler;
 pub mod task;
@@ -68,11 +105,13 @@ pub mod task;
 pub use blackboard::Blackboard;
 pub use builders::TaskBuilder;
 pub use errors::{TaskError, TaskResult};
+pub use events::SchedulerEvent;
 pub use generator::TaskGenerator;
 pub use retry::{Backoff, Jitter, RetryPolicy};
 pub use scheduler::{SchedulerHandle, TaskScheduler, TaskSpawner, TaskState};
 pub use task::{
-    OverlapPolicy, RunOutcome, RunRecord, Status, StepState, StepStatus, Task, TaskContext,
+    FinishReason, FinishReport, MissedRunPolicy, OverlapPolicy, RunOutcome, RunRecord, RunReport,
+    Status, StepState, StepStatus, Task, TaskContext,
 };
 
 /// Macro for consistent task-related logging

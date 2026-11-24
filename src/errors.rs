@@ -33,11 +33,12 @@ pub enum TaskError {
     #[error("A task named '{0}' is already registered")]
     DuplicateTaskName(String),
 
-    /// A required component is missing.
-    #[error("Missing required component: {0}")]
-    MissingComponent(String),
+    /// The task names a concurrency pool that was not created with
+    /// [`TaskScheduler::add_pool`](crate::TaskScheduler::add_pool).
+    #[error("No concurrency pool named '{0}'")]
+    UnknownPool(String),
 
-    /// A generic error occurred during task execution.
+    /// The scheduler could not process a request, for example because it has stopped.
     #[error("Task execution error: {0}")]
     ExecutionError(String),
 }

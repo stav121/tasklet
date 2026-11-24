@@ -3,15 +3,16 @@ use simple_logger::SimpleLogger;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tasklet::task::TaskStepStatusErr::Error;
+use tasklet::task::TaskStepStatusErr;
 use tasklet::task::TaskStepStatusOk::Success;
-use tasklet::{Jitter, RetryPolicy, TaskBuilder, TaskScheduler};
+use tasklet::{FinishReport, Jitter, RetryPolicy, RunReport, TaskBuilder, TaskScheduler};
 
 /// Showcase of the resilience features:
 ///
-/// * `.timeout(..)`  — bounds each individual step attempt.
-/// * `.retry(..)`    — re-attempts failing steps with a backoff policy and jitter.
-/// * `.on_success` / `.on_failure` / `.on_finish` — async lifecycle callbacks.
+/// * `.timeout(..)`: bounds each individual step attempt.
+/// * `.retry(..)`: re-attempts failing steps with a backoff policy and jitter.
+/// * `.on_success` / `.on_failure` / `.on_finish`: async lifecycle callbacks that
+///   receive a report of the run (or of the task's end).
 ///
 /// The task runs a single time (`repeat(1)`). Its step fails on the first two
 /// attempts and succeeds on the third, so the retry policy is exercised, then the
@@ -42,17 +43,34 @@ async fn main() {
                     .with_max_delay(Duration::from_secs(1))
                     .with_jitter(Jitter::Full),
             )
-            // Async lifecycle callbacks.
-            .on_success(|| async { info!("run succeeded") })
-            .on_failure(|| async { info!("run failed after exhausting retries") })
-            .on_finish(|| async { info!("task finished its lifecycle") })
+            // Async lifecycle callbacks. The run report counts every attempt, so it
+            // shows how many retries the run needed.
+            .on_success(|report: RunReport| async move {
+                info!(
+                    "run {} succeeded after {} attempt(s)",
+                    report.record.run_id, report.record.attempts
+                )
+            })
+            .on_failure(|report: RunReport| async move {
+                info!(
+                    "run {} failed after exhausting retries: {}",
+                    report.record.run_id,
+                    report.record.error.unwrap_or_default()
+                )
+            })
+            .on_finish(|report: FinishReport| async move {
+                info!("task finished its lifecycle ({:?})", report.reason)
+            })
             .add_step("Flaky step", move |_ctx| {
                 let attempts = step_attempts.clone();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                     if attempt < 2 {
                         info!("attempt #{} failing, will be retried", attempt + 1);
-                        Err(Error)
+                        Err(TaskStepStatusErr::error(format!(
+                            "simulated failure on attempt {}",
+                            attempt + 1
+                        )))
                     } else {
                         info!("attempt #{} succeeding", attempt + 1);
                         Ok(Success)
@@ -62,7 +80,7 @@ async fn main() {
             .build(),
     );
 
-    // Run for a few seconds, then stop cleanly — long enough for the task to run,
+    // Run for a few seconds, then stop cleanly. That is long enough for the task to run,
     // retry and finish.
     scheduler
         .run_until(tokio::time::sleep(Duration::from_secs(5)))

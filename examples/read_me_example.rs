@@ -35,7 +35,7 @@ async fn main() {
                 exec_count += 1;
                 async move {
                     if count % 2 == 0 {
-                        Err(Error) // Indicate that this step was a fail.
+                        Err(Error("even run".into())) // Indicate that this step was a fail.
                     } else {
                         info!("Hello from step 2");
                         Ok(Success) // Indicate that this step was a success.

@@ -1,8 +1,8 @@
 use log::info;
 use simple_logger::SimpleLogger;
-use tasklet::task::TaskStepStatusErr::{Error, ErrorDelete};
+use tasklet::task::TaskStepStatusErr;
 use tasklet::task::TaskStepStatusOk::Success;
-use tasklet::{TaskBuilder, TaskScheduler};
+use tasklet::{FinishReport, TaskBuilder, TaskScheduler};
 
 /// A simple example of a task with two steps, that might work or fail sometimes and
 /// on the 10th execution it is forcibly removed from the queue.
@@ -24,6 +24,10 @@ async fn main() {
         TaskBuilder::new(chrono::Local)
             .every("0,5,10,15,20,25,30,35,40,45,50,55 * * * * * *")
             .description("A simple task")
+            // Fires once, when the step above asks for the task to be removed.
+            .on_finish(|report: FinishReport| async move {
+                info!("Task left the scheduler: {:?}", report.reason);
+            })
             .add_step("Step 1", |_ctx| async {
                 info!("Hello from step 1");
                 Ok(Success) // Let the scheduler know this step was a success.
@@ -36,10 +40,10 @@ async fn main() {
                 async move {
                     if count == 10 {
                         info!("Force deleting!");
-                        return Err(ErrorDelete);
+                        return Err(TaskStepStatusErr::error_delete("reached the tenth run"));
                     }
                     if count % 2 == 0 {
-                        Err(Error) // Indicate that this step was a fail.
+                        Err(TaskStepStatusErr::error("even run")) // Indicate that this step was a fail.
                     } else {
                         info!("Hello from step 2");
                         Ok(Success) // Indicate that this step was a success.

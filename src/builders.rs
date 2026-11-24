@@ -2,8 +2,8 @@ use crate::blackboard::Blackboard;
 use crate::errors::{TaskError, TaskResult};
 use crate::retry::RetryPolicy;
 use crate::task::{
-    boxed_callback, CallbackFn, OverlapPolicy, Task, TaskContext, TaskStep, TaskStepStatusErr,
-    TaskStepStatusOk, DEFAULT_HISTORY_LIMIT,
+    boxed_callback, CallbackFn, FinishReport, MissedRunPolicy, OverlapPolicy, RunReport, Task,
+    TaskContext, TaskStep, TaskStepStatusErr, TaskStepStatusOk, DEFAULT_HISTORY_LIMIT,
 };
 use chrono::TimeZone;
 use cron::Schedule;
@@ -37,13 +37,17 @@ where
     /// (Optional) retry policy for failing steps.
     retry_policy: Option<RetryPolicy>,
     /// (Optional) callback invoked after a successful execution.
-    on_success: Option<Box<CallbackFn>>,
+    on_success: Option<Box<CallbackFn<RunReport>>>,
     /// (Optional) callback invoked after a failed execution.
-    on_failure: Option<Box<CallbackFn>>,
-    /// (Optional) callback invoked once the task reaches a terminal state.
-    on_finish: Option<Box<CallbackFn>>,
+    on_failure: Option<Box<CallbackFn<RunReport>>>,
+    /// (Optional) callback invoked once the task leaves the scheduler.
+    on_finish: Option<Box<CallbackFn<FinishReport>>>,
     /// Behaviour when a run overlaps a still-running one.
     overlap: OverlapPolicy,
+    /// Behaviour when a scheduled run starts late.
+    missed_runs: MissedRunPolicy,
+    /// (Optional) the concurrency pool the task runs in.
+    pool: Option<String>,
     /// (Optional) task-level blackboard shared with every step through its context.
     blackboard: Option<Blackboard>,
     /// The Task/Scheduler timezone.
@@ -81,6 +85,8 @@ where
             on_failure: None,
             on_finish: None,
             overlap: OverlapPolicy::default(),
+            missed_runs: MissedRunPolicy::default(),
+            pool: None,
             blackboard: None,
             timezone,
         }
@@ -329,23 +335,6 @@ where
         self
     }
 
-    /// Set the overlap policy: what to do when a scheduled run comes due while a
-    /// previous run of this task is still in progress.
-    ///
-    /// # Arguments
-    ///
-    /// * overlap   - The [`OverlapPolicy`] to apply (defaults to `Skip`).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use tasklet::{OverlapPolicy, TaskBuilder};
-    /// let _task = TaskBuilder::new(chrono::Local)
-    ///     .every("* * * * * * *")
-    ///     .overlap(OverlapPolicy::Queue)
-    ///     .build()
-    ///     .unwrap();
-    /// ```
     /// Attach a task-level [`Blackboard`] to the generated task.
     ///
     /// Every step receives it through its [`TaskContext`]
@@ -375,12 +364,74 @@ where
         self
     }
 
+    /// Set the overlap policy: what to do when a scheduled run comes due while a
+    /// previous run of this task is still in progress.
+    ///
+    /// # Arguments
+    ///
+    /// * overlap   - The [`OverlapPolicy`] to apply (defaults to `Skip`).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::{OverlapPolicy, TaskBuilder};
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every("* * * * * * *")
+    ///     .overlap(OverlapPolicy::Queue)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
     pub fn overlap(mut self, overlap: OverlapPolicy) -> TaskBuilder<T> {
         self.overlap = overlap;
         self
     }
 
-    /// Register a callback invoked after each successful execution of the task.
+    /// Set the missed-run policy: what to do with a scheduled run that starts late,
+    /// because the task was paused when it came due or the process was busy or
+    /// suspended. Defaults to [`MissedRunPolicy::RunOnce`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::time::Duration;
+    /// # use tasklet::{MissedRunPolicy, TaskBuilder};
+    /// let _task = TaskBuilder::new(chrono::Local)
+    ///     .every_minutes(1)
+    ///     .missed_runs(MissedRunPolicy::Skip { grace: Duration::from_secs(10) })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn missed_runs(mut self, policy: MissedRunPolicy) -> TaskBuilder<T> {
+        self.missed_runs = policy;
+        self
+    }
+
+    /// Run the task in a named concurrency pool.
+    ///
+    /// At most the pool's limit of runs from tasks in the same pool execute at once. The
+    /// pool must be created with [`TaskScheduler::add_pool`](crate::TaskScheduler::add_pool)
+    /// before the task is added, otherwise adding it fails with
+    /// [`TaskError::UnknownPool`](crate::TaskError::UnknownPool).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use tasklet::{TaskBuilder, TaskScheduler};
+    /// let mut scheduler = TaskScheduler::default(chrono::Utc);
+    /// scheduler.add_pool("database", 2);
+    /// scheduler
+    ///     .add_task(TaskBuilder::new(chrono::Utc).every_minutes(5).pool("database").build())
+    ///     .unwrap();
+    /// ```
+    pub fn pool(mut self, pool: &str) -> TaskBuilder<T> {
+        self.pool = Some(pool.to_string());
+        self
+    }
+
+    /// Register a callback invoked after each successful run of the task (including runs
+    /// where a step reported [`TaskStepStatusOk::HadErrors`]).
+    ///
+    /// The callback receives the run's [`RunReport`].
     ///
     /// # Arguments
     ///
@@ -392,20 +443,29 @@ where
     /// # use tasklet::TaskBuilder;
     /// let _task = TaskBuilder::new(chrono::Local)
     ///     .every("* * * * * * *")
-    ///     .on_success(|| async { println!("task succeeded"); })
+    ///     .on_success(|report| async move {
+    ///         println!("run {} succeeded", report.record.run_id);
+    ///     })
     ///     .build()
     ///     .unwrap();
     /// ```
     pub fn on_success<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(RunReport) -> Fut) + 'static + Send,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_success = Some(boxed_callback(callback));
         self
     }
 
-    /// Register a callback invoked after a failed execution of the task.
+    /// Register a callback invoked after a failed run of the task: a step failed after
+    /// its last attempt, or returned [`TaskStepStatusErr::ErrorDelete`].
+    ///
+    /// The callback receives the run's [`RunReport`]; `report.record.error` holds the
+    /// failing step's reason and `report.record.failed_step` its index. A run interrupted
+    /// by removal or shutdown fires no `on_failure`, unless a step returned
+    /// [`TaskStepStatusErr::ErrorDelete`], which always counts as a failure. A panicking
+    /// step counts as a failed attempt with the panic message as its reason.
     ///
     /// # Arguments
     ///
@@ -417,21 +477,28 @@ where
     /// # use tasklet::TaskBuilder;
     /// let _task = TaskBuilder::new(chrono::Local)
     ///     .every("* * * * * * *")
-    ///     .on_failure(|| async { eprintln!("task failed"); })
+    ///     .on_failure(|report| async move {
+    ///         eprintln!("task failed: {:?}", report.record.error);
+    ///     })
     ///     .build()
     ///     .unwrap();
     /// ```
     pub fn on_failure<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(RunReport) -> Fut) + 'static + Send,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_failure = Some(boxed_callback(callback));
         self
     }
 
-    /// Register a callback invoked once when the task reaches a terminal state
-    /// (its repeat cycle is exhausted or it is force-removed).
+    /// Register a callback invoked once when the task leaves the scheduler: its repeat
+    /// cycle is exhausted or its schedule ends, a step force-removed it, it was removed
+    /// through the handle, or the scheduler shut down.
+    ///
+    /// The callback receives a [`FinishReport`] with the [`FinishReason`](crate::FinishReason)
+    /// and the task's last run. On removal and shutdown it runs within the scheduler's
+    /// [grace period](crate::TaskScheduler::grace_period).
     ///
     /// # Arguments
     ///
@@ -444,13 +511,15 @@ where
     /// let _task = TaskBuilder::new(chrono::Local)
     ///     .every("* * * * * * *")
     ///     .repeat(1)
-    ///     .on_finish(|| async { println!("task finished"); })
+    ///     .on_finish(|report| async move {
+    ///         println!("task finished: {:?}", report.reason);
+    ///     })
     ///     .build()
     ///     .unwrap();
     /// ```
     pub fn on_finish<F, Fut>(mut self, callback: F) -> TaskBuilder<T>
     where
-        F: (FnMut() -> Fut) + 'static + Send,
+        F: (FnMut(FinishReport) -> Fut) + 'static + Send,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_finish = Some(boxed_callback(callback));
@@ -473,7 +542,7 @@ where
     /// ```rust
     /// # use tasklet::task::TaskStepStatusErr::Error;
     /// # use tasklet::TaskBuilder;
-    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", |_ctx| async { Err(Error) });
+    /// let _ = TaskBuilder::new(chrono::Utc).add_step("A step that fails.", |_ctx| async { Err(Error("boom".to_string())) });
     /// ```
     pub fn add_step<F, Fut>(mut self, description: &str, function: F) -> TaskBuilder<T>
     where
@@ -559,6 +628,10 @@ where
             task.set_retry_policy(policy);
         }
         task.set_overlap(self.overlap);
+        task.set_missed_runs(self.missed_runs);
+        if let Some(pool) = self.pool.as_deref() {
+            task.set_pool(pool);
+        }
 
         // Attach the task-level blackboard, if one was provided.
         if let Some(blackboard) = self.blackboard {
